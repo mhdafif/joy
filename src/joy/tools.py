@@ -6,7 +6,9 @@ import subprocess
 import tempfile
 import time
 import unicodedata
+from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import dataclass
 from difflib import unified_diff
 from pathlib import Path
 from threading import Event, Lock
@@ -17,6 +19,14 @@ OUTPUT_LIMIT = 20_000
 FILE_LIMIT = 2_000_000
 # ponytail: serialize file mutations globally; use per-file locks if concurrency grows.
 MUTATION_LOCK = Lock()
+
+
+@dataclass(frozen=True)
+class Change:
+    path: str
+    kind: str
+    before: str
+    after: str
 
 
 def _lf(text: str) -> str:
@@ -88,8 +98,14 @@ def _save(path: Path, content: str) -> None:
             temporary.unlink(missing_ok=True)
 
 
-def create_tools(workspace: Path, cancelled: Event) -> Tools:
+def create_tools(
+    workspace: Path, cancelled: Event, on_change: Callable[[Change], None] | None = None,
+) -> Tools:
     root = workspace.resolve()
+
+    def record(change: Change) -> None:
+        if on_change is not None:
+            on_change(change)
 
     def resolve(path: str) -> Path:
         target = (root / path).resolve()
@@ -115,7 +131,12 @@ def create_tools(workspace: Path, cancelled: Event) -> Tools:
     def write(path: str, content: str) -> str:
         """Create or overwrite a UTF-8 file, creating parent directories if needed."""
         with MUTATION_LOCK:
-            _save(resolve(path), content)
+            target = resolve(path)
+            before = None
+            if target.is_file() and target.stat().st_size <= FILE_LIMIT:
+                before = target.read_bytes().decode("utf-8", errors="replace")
+            _save(target, content)
+        record(Change(path, "created" if before is None else "modified", before or "", content))
         return f"Wrote {path}."
 
     def edit(path: str, old_text: str, new_text: str) -> str:
@@ -134,6 +155,7 @@ def create_tools(workspace: Path, cancelled: Event) -> Tools:
             if target.read_bytes().decode("utf-8") != original:
                 raise ValueError("File changed during editing. Read it and retry.")
             _save(target, updated)
+        record(Change(path, "modified", original, updated))
         diff = "".join(unified_diff(original.splitlines(keepends=True),
                                     updated.splitlines(keepends=True),
                                     fromfile=path, tofile=path))

@@ -29,7 +29,11 @@ class CliTest(unittest.TestCase):
                     try:
                         self.assertEqual(session.default_buffer.text, 'first line\nlast line\n')
                         info = session.layout.current_window.render_info
-                        visible = to_plain_text(info.ui_content.get_line(info.vertical_scroll))
+                        visible = ''.join(
+                            to_plain_text(info.ui_content.get_line(index))
+                            for index in range(info.first_visible_line(), info.last_visible_line() + 1)
+                        )
+                        self.assertIn('first line', visible)
                         self.assertIn('last line', visible)
                         inspected.append(True)
                     except AssertionError as error:

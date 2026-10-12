@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 from collections.abc import AsyncIterator
 from contextlib import suppress
@@ -12,9 +13,9 @@ from threading import Event, Thread
 
 from openai import OpenAI, APIConnectionError, APIStatusError, APITimeoutError
 
-from joy.tools import create_tools
+from joy.tools import Change, create_tools
 
-MODEL = "openai:gpt-5.6-luna"
+MODEL = "openai:" + os.environ.get("JOY_MODEL", "gpt-5.6-luna")
 
 
 @dataclass(frozen=True)
@@ -59,7 +60,7 @@ def _error_message(error: Exception) -> str:
 
 
 async def stream_reply(messages: list[dict]) -> AsyncIterator[str | ToolEvent]:
-    result: Queue[str | ToolEvent | Exception | None] = Queue()
+    result: Queue[str | ToolEvent | Change | Exception | None] = Queue()
     cancelled = Event()
     workspace = Path.cwd()
 
@@ -67,7 +68,7 @@ async def stream_reply(messages: list[dict]) -> AsyncIterator[str | ToolEvent]:
         client = None
         try:
             client = OpenAI(timeout=60.0, max_retries=0)
-            toolbox = create_tools(workspace, cancelled)
+            toolbox = create_tools(workspace, cancelled, result.put)
             conversation = list(messages)
             for _ in range(16):
                 if cancelled.is_set():
