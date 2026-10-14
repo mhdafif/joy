@@ -12,6 +12,8 @@ from rich.text import Span, Text
 from joy.tools import Change
 
 COLLAPSED_LINES = 20
+NO_EOL = "\x00"
+NO_EOL_NOTE = "  ⏎ no newline at end of file"
 CONTEXT_LINES = 3
 HIGHLIGHT_LIMIT = 200_000
 PANEL_BACKGROUND = "#1a1a1a"
@@ -33,6 +35,8 @@ def _lines(text: str) -> list[str]:
     lines = _normalize(text).split("\n")
     if lines and lines[-1] == "":
         lines.pop()
+    elif lines:
+        lines[-1] += NO_EOL
     return lines
 
 
@@ -104,7 +108,8 @@ def render_change(change: Change, number: int, limit: int | None = COLLAPSED_LIN
     hidden = len(rows) - len(shown)
     subtitle = Text(f"… {hidden} more lines · /expand {number}", style="dim") if hidden else None
     if not rows:
-        body: Table | Text = Text("(no changes)", style="dim")
+        message = "(no changes)" if change.before == change.after else "(line endings changed)"
+        body: Table | Text = Text(message, style="dim")
     else:
         old_text = _highlight(change.path, change.before) if change.kind != "created" else None
         new_text = _highlight(change.path, change.after)
@@ -115,6 +120,8 @@ def render_change(change: Change, number: int, limit: int | None = COLLAPSED_LIN
         body.add_column(ratio=1)
         for row in shown:
             line_number, sign, content = row
+            missing_newline = content.endswith(NO_EOL)
+            content = content.removesuffix(NO_EOL)
             if sign == GAP:
                 body.add_row("", Text(GAP, style="dim"), "")
                 continue
@@ -123,6 +130,8 @@ def render_change(change: Change, number: int, limit: int | None = COLLAPSED_LIN
                 code = source[line_number - 1].copy()
             else:
                 code = Text(content.expandtabs(4))
+            if missing_newline:
+                code.append(NO_EOL_NOTE, style="dim italic")
             code.overflow = "fold"
             body.add_row(
                 Text(str(line_number), style=NUMBER_STYLES[sign]),
