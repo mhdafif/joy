@@ -15,8 +15,8 @@ from openai import OpenAI, APIConnectionError, APIStatusError, APITimeoutError
 
 from joy.tools import Change, create_tools
 
-MODEL = "openai:" + os.environ.get("JOY_MODEL", "gpt-5.6-luna")
-
+DEFAULT_MODEL = os.environ.get("JOY_MODEL", "gpt-5.6-luna")
+MODEL = "openai:" + DEFAULT_MODEL
 
 DETAIL_LIMIT = 200
 
@@ -44,7 +44,7 @@ def _describe(arguments: str) -> str:
     return text if len(text) <= DETAIL_LIMIT else text[:DETAIL_LIMIT - 1] + "…"
 
 
-def _error_message(error: Exception) -> str:
+def _error_message(error: Exception, model: str = DEFAULT_MODEL) -> str:
     # Preserve useful diagnostics from wrapped errors without printing raw messages.
     seen = set()
     while id(error) not in seen:
@@ -58,7 +58,7 @@ def _error_message(error: Exception) -> str:
             400: "The API rejected the request parameters.",
             401: "The API rejected your API key.",
             403: "Your account lacks permission for this request.",
-            404: f"Check access to {MODEL} and your API base URL.",
+            404: f"Check access to {model} and your API base URL.",
             429: "Rate limit or quota exceeded; check API usage and billing.",
         }
         details = []
@@ -79,7 +79,20 @@ def _error_message(error: Exception) -> str:
     return f"Local error: {type(error).__name__}. Check the installed dependencies and configuration."
 
 
-async def stream_reply(messages: list[dict]) -> AsyncIterator[str | ToolEvent | Change | Usage]:
+def list_models() -> list[str]:
+    client = OpenAI(timeout=15.0, max_retries=0)
+    try:
+        return sorted({model.id for model in client.models.list()})
+    except Exception as error:
+        raise RuntimeError(_error_message(error)) from error
+    finally:
+        client.close()
+
+
+async def stream_reply(
+    messages: list[dict], model: str | None = None,
+) -> AsyncIterator[str | ToolEvent | Change | Usage]:
+    model = model or DEFAULT_MODEL
     result: Queue[str | ToolEvent | Change | Usage | Exception | None] = Queue()
     cancelled = Event()
     workspace = Path.cwd()
@@ -96,7 +109,7 @@ async def stream_reply(messages: list[dict]) -> AsyncIterator[str | ToolEvent | 
                 text = ""
                 completed = None
                 with client.responses.create(
-                    model=MODEL.split(":", 1)[1], input=conversation, stream=True,
+                    model=model, input=conversation, stream=True,
                     reasoning={"effort": "medium"}, store=False,
                     include=["reasoning.encrypted_content"],
                     tools=[{"type": "function", **tool["function"], "strict": False}
@@ -148,7 +161,7 @@ async def stream_reply(messages: list[dict]) -> AsyncIterator[str | ToolEvent | 
             result.put(RuntimeError("Reached the 16-step limit. Ask Joy to continue."))
         except Exception as error:
             result.put(RuntimeError(
-                "OpenAI could not return a reply. " + _error_message(error)
+                "OpenAI could not return a reply. " + _error_message(error, model)
             ))
         finally:
             if client is not None:

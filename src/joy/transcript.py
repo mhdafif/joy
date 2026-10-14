@@ -1,6 +1,7 @@
 """Scrollable transcript for the full-screen interface, rendered from Rich objects."""
 
 import re
+from collections.abc import Callable
 from io import StringIO
 
 from prompt_toolkit.application import get_app
@@ -31,8 +32,9 @@ def render_lines(renderable: RenderableType, width: int) -> list[Line]:
 
 
 class Block:
-    def __init__(self, renderable: RenderableType) -> None:
+    def __init__(self, renderable: RenderableType, on_click: Callable[["Block"], None] | None = None) -> None:
         self.renderable = renderable
+        self.on_click = on_click
         self.width = 0
         self.lines: list[Line] = []
 
@@ -46,16 +48,25 @@ class Block:
 class Transcript(UIControl):
     def __init__(self) -> None:
         self.blocks: list[Block] = []
-        self.live_version = 0
+        self.version = 0
         self.live_block: Block | None = None
+        self.owners: list[Block | None] = []
+        self.visible: list[Block | None] = []
         self.scroll_back = 0
         self.height = 24
         self.total = 0
-        self.joined_key: tuple[int, int, int] | None = None
+        self.joined_key: tuple[int, int] | None = None
         self.joined: list[Line] = []
 
-    def add(self, renderable: RenderableType) -> None:
-        self.blocks.append(Block(renderable))
+    def add(self, renderable: RenderableType, on_click: Callable[[Block], None] | None = None) -> Block:
+        block = Block(renderable, on_click)
+        self.blocks.append(block)
+        self.version += 1
+        return block
+
+    def refresh(self, block: Block) -> None:
+        block.width = 0
+        self.version += 1
 
     def clear(self) -> None:
         self.blocks.clear()
@@ -64,20 +75,23 @@ class Transcript(UIControl):
         self.total = 0
         self.joined_key = None
         self.joined = []
+        self.owners = []
+        self.visible = []
 
     def set_live(self, renderable: RenderableType | None) -> None:
         self.live_block = None if renderable is None else Block(renderable)
-        self.live_version += 1
+        self.version += 1
 
     def lines(self, width: int) -> list[Line]:
-        key = (width, len(self.blocks), self.live_version)
+        key = (width, self.version)
         if key != self.joined_key:
             joined: list[Line] = []
-            for block in self.blocks:
-                joined.extend(block.get(width))
-            if self.live_block is not None:
-                joined.extend(self.live_block.get(width))
-            self.joined, self.joined_key = joined, key
+            owners: list[Block | None] = []
+            for block in [*self.blocks, *([self.live_block] if self.live_block is not None else [])]:
+                block_lines = block.get(width)
+                joined.extend(block_lines)
+                owners.extend([block] * len(block_lines))
+            self.joined, self.owners, self.joined_key = joined, owners, key
         return self.joined
 
     def plain(self, width: int = 80) -> str:
@@ -104,7 +118,9 @@ class Transcript(UIControl):
         self.height = height
         self.scroll_back = max(0, min(self.scroll_back, total - height))
         end = total - self.scroll_back
-        visible = lines[max(0, end - height):end]
+        start = max(0, end - height)
+        visible = lines[start:end]
+        self.visible = self.owners[start:end]
         return UIContent(
             get_line=lambda index: visible[index] if index < len(visible) else [],
             line_count=len(visible), show_cursor=False,
@@ -115,6 +131,12 @@ class Transcript(UIControl):
             self.scroll(WHEEL_STEP)
         elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
             self.scroll(-WHEEL_STEP)
+        elif mouse_event.event_type == MouseEventType.MOUSE_UP:
+            row = mouse_event.position.y
+            block = self.visible[row] if 0 <= row < len(self.visible) else None
+            if block is None or block.on_click is None:
+                return NotImplemented
+            block.on_click(block)
         else:
             return NotImplemented
         get_app().invalidate()

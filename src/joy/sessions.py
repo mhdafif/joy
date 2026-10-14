@@ -1,12 +1,13 @@
 """Save and restore conversations so they can be continued later."""
 
 import json
-import os
 import secrets
 import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+
+from joy.settings import joy_home
 
 NAME_LIMIT = 80
 
@@ -23,7 +24,7 @@ class Session:
 
 
 def sessions_dir() -> Path:
-    return Path(os.environ.get("JOY_HOME") or Path.home() / ".joy") / "sessions"
+    return joy_home() / "sessions"
 
 
 def session_name(message: str) -> str:

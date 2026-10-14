@@ -105,7 +105,7 @@ class CliTest(unittest.TestCase):
         original_sleep = asyncio.sleep
         transcripts = []
 
-        async def fake_reply(messages):
+        async def fake_reply(messages, model=None):
             requests.append(messages)
             await original_sleep(0.02)
             content = messages[-1]["content"]
@@ -187,7 +187,7 @@ class CliTest(unittest.TestCase):
     def test_sessions_are_saved_continued_and_switched(self):
         requests = []
 
-        async def fake_reply(messages):
+        async def fake_reply(messages, model=None):
             requests.append(messages)
             yield "Reply to " + messages[-1]["content"] + "."
 

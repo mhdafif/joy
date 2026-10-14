@@ -7,7 +7,7 @@ import sys
 import time
 from collections.abc import Callable
 from contextlib import aclosing
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -18,7 +18,7 @@ from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
-from prompt_toolkit.layout import ConditionalContainer, Dimension, HSplit, Layout, Window
+from prompt_toolkit.layout import Dimension, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.processors import Processor, Transformation, TransformationInput
 from prompt_toolkit.output import ColorDepth
@@ -31,27 +31,42 @@ from rich.padding import Padding
 from rich.text import Text
 
 from joy.diffview import COLLAPSED_LINES, merge_changes, render_change
-from joy.llm import MODEL, ToolEvent, Usage, stream_reply
+from joy.llm import DEFAULT_MODEL, ToolEvent, Usage, list_models, stream_reply
 from joy.sessions import Session, latest_session, list_sessions, new_session, save_session
+from joy.settings import load_settings, save_settings
+from joy.steps import StepGroup
 from joy.tools import Change
-from joy.transcript import Transcript
+from joy.transcript import Block, Transcript
 
 INPUT_MAX_ROWS = 10
 PICKER_ROWS = 8
 RESUME_FLAGS = ("-c", "--continue")
-TOOL_GLYPHS = {"read": ("→", "Read"), "write": ("←", "Write"), "edit": ("←", "Edit"), "bash": ("$", "")}
 NEWLINE_KEY = "Option+Enter" if sys.platform == "darwin" else "Alt+Enter"
 COMMANDS = {
     "/expand": "show a full diff",
     "/session": "switch to another session",
-    "/restart": "restart Joy and clear history",
+    "/new": "start a new session",
+    "/clear": "start a new session",
+    "/model": "choose the model",
+    "/restart": "restart Joy and start a new session",
     "/exit": "quit Joy",
 }
+
+
+@dataclass
+class PickerItem:
+    label: str
+    detail: str
+    value: object
 
 
 def format_elapsed(seconds: float) -> str:
     whole = int(seconds)
     return f"{whole}s" if whole < 60 else f"{whole // 60}m {whole % 60:02d}s"
+
+
+def format_tokens(count: int) -> str:
+    return f"{count} tokens" if count < 1000 else f"{count / 1000:.1f}k tokens"
 
 
 def matching_commands(text: str) -> list[str]:
@@ -76,37 +91,28 @@ def format_date(timestamp: float) -> str:
     return moment.strftime("%b %d, %H:%M" if moment.year == datetime.now().year else "%b %d %Y")
 
 
-def format_tokens(count: int) -> str:
-    return f"{count} tokens" if count < 1000 else f"{count / 1000:.1f}k tokens"
-
-
 def render_answer(text: str) -> RenderableType:
     return Padding(Markdown(text.lstrip()), (0, 0, 0, 1))
-
-
-def render_tool(part: dict) -> RenderableType:
-    glyph, label = TOOL_GLYPHS.get(part["name"], ("◆", part["name"]))
-    failed = part.get("status") == "failed"
-    line = Text()
-    line.append(("✗" if failed else glyph) + " ", style="red" if failed else "cyan")
-    if label:
-        line.append(label + " ", style="bold")
-    line.append(part.get("detail", ""))
-    if failed and part.get("error"):
-        line.append(" — " + part["error"], style="red")
-    return Padding(line, (0, 0, 0, 1))
 
 
 def render_parts(parts: list[dict]) -> RenderableType:
     items: list[RenderableType] = []
     previous = None
+    group: StepGroup | None = None
     for part in parts:
         kind = part["t"]
         if kind == "text" and not part["text"].strip():
             continue
-        if previous is not None and previous != kind:
+        if kind == "tool" and previous == "tool" and group is not None:
+            group.steps.append(part)
+            continue
+        if previous is not None:
             items.append(Text(""))
-        items.append(render_answer(part["text"]) if kind == "text" else render_tool(part))
+        if kind == "tool":
+            group = StepGroup(True, [part])
+            items.append(group)
+        else:
+            items.append(render_answer(part["text"]))
         previous = kind
     return Group(*items)
 
@@ -137,7 +143,12 @@ def main(argv: list[str] | None = None) -> None:
     current: Session | None = None
     picking = False
     picked = 0
-    all_sessions: list[Session] = []
+    picker_title = ""
+    picker_note = ""
+    picker_items: list[PickerItem] = []
+    picker_choose: Callable[[PickerItem], None] | None = None
+    picker_custom: Callable[[str], PickerItem] | None = None
+    picker_id = 0
     transcript = Transcript()
     bindings = KeyBindings()
     waiting = False
@@ -147,6 +158,9 @@ def main(argv: list[str] | None = None) -> None:
     parts: list[dict] = []
     tokens = 0
     last_kind: str | None = None
+    last_group: Block | None = None
+    group_blocks: list[Block] = []
+    steps_open = False
     used_tools = False
     task: asyncio.Task | None = None
     pending: list[Change] = []
@@ -157,7 +171,7 @@ def main(argv: list[str] | None = None) -> None:
     home = str(Path.home())
     if folder == home or folder.startswith(home + os.sep):
         folder = "~" + folder[len(home):]
-    model = MODEL.split(":", 1)[1]
+    model = str(load_settings().get("model") or DEFAULT_MODEL)
 
     def reset_selection(_) -> None:
         nonlocal selected, picked
@@ -169,26 +183,16 @@ def main(argv: list[str] | None = None) -> None:
     def suggestions() -> list[str]:
         return [] if waiting or picking else matching_commands(buffer.text)
 
-    def visible_sessions() -> list[Session]:
+    def visible_items() -> list[PickerItem]:
+        if not picking:
+            return []
         query = buffer.text.strip().lower()
-        return [session for session in all_sessions if query in session.name.lower()] if picking else []
+        items = [item for item in picker_items if query in item.label.lower()]
+        if picker_custom is not None and query and not any(item.label.lower() == query for item in picker_items):
+            items.append(picker_custom(buffer.text.strip()))
+        return items
 
-    def render_suggestions() -> StyleAndTextTuples:
-        options = suggestions()
-        current = min(selected, len(options) - 1)
-        width = get_app().output.get_size().columns
-        rows: list[list[tuple[str, str]]] = []
-        if not options:
-            rows.append([("#6b6b6b", f"Enter sends · {NEWLINE_KEY} or Ctrl+J adds a new line")])
-            rows.append([("", " ")])
-        for index, command in enumerate(options):
-            if index == current:
-                rows.append([("bg:#e8975a #1a1a1a", f" {command:<10} {COMMANDS[command]}".ljust(width))])
-            else:
-                rows.append([
-                    ("bg:#1a1a1a bold #ffffff", f" {command:<10}"),
-                    ("bg:#1a1a1a #808080", f" {COMMANDS[command]}".ljust(width - 11)),
-                ])
+    def join_rows(rows: list[list[tuple[str, str]]]) -> StyleAndTextTuples:
         fragments: StyleAndTextTuples = []
         for index, row in enumerate(rows):
             if index:
@@ -196,48 +200,94 @@ def main(argv: list[str] | None = None) -> None:
             fragments.extend(row)
         return fragments
 
-    def render_picker() -> StyleAndTextTuples:
-        options = visible_sessions()
+    def render_suggestions() -> StyleAndTextTuples:
+        options = suggestions()
+        current_index = min(selected, len(options) - 1)
         width = get_app().output.get_size().columns
-        current_index = min(picked, len(options) - 1)
-        start = max(0, min(current_index - PICKER_ROWS // 2, len(options) - PICKER_ROWS))
-        fragments: StyleAndTextTuples = [("#6b6b6b", " Sessions · type to search · Enter opens · Esc closes")]
+        rows: list[list[tuple[str, str]]] = []
         if not options:
-            fragments.extend([("", "\n"), ("#808080", " No matching sessions")])
-        for index in range(start, min(len(options), start + PICKER_ROWS)):
-            date = format_date(options[index].updated)
-            name = options[index].name
-            room = max(width - get_cwidth(date) - 4, 10)
+            rows.append([("#6b6b6b", f"Enter sends · {NEWLINE_KEY} or Ctrl+J adds a new line")])
+            rows.append([("", " ")])
+        for index, command in enumerate(options):
+            if index == current_index:
+                rows.append([("bg:#e8975a #1a1a1a", f" {command:<10} {COMMANDS[command]}".ljust(width))])
+            else:
+                rows.append([
+                    ("bg:#1a1a1a bold #ffffff", f" {command:<10}"),
+                    ("bg:#1a1a1a #808080", f" {COMMANDS[command]}".ljust(width - 11)),
+                ])
+        return join_rows(rows)
+
+    def picker_rows() -> list[list[tuple[str, str]]]:
+        items = visible_items()
+        width = get_app().output.get_size().columns
+        current_index = min(picked, len(items) - 1)
+        start = max(0, min(current_index - PICKER_ROWS // 2, len(items) - PICKER_ROWS))
+        rows: list[list[tuple[str, str]]] = [[(
+            "#6b6b6b", f" {picker_title} · type to search · Enter selects · Esc closes",
+        )]]
+        if picker_note:
+            rows.append([("#808080", f" {picker_note}")])
+        elif not items:
+            rows.append([("#808080", " No matches")])
+        for index in range(start, min(len(items), start + PICKER_ROWS)):
+            detail = items[index].detail
+            name = items[index].label
+            room = max(width - get_cwidth(detail) - 4, 10)
             while get_cwidth(name) > room:
                 name = name[:-2] + "…"
-            gap = " " * max(1, width - get_cwidth(name) - get_cwidth(date) - 2)
-            fragments.append(("", "\n"))
+            gap = " " * max(1, width - get_cwidth(name) - get_cwidth(detail) - 2)
             if index == current_index:
-                fragments.append(("bg:#e8975a #1a1a1a", f" {name}{gap}{date} "))
+                rows.append([("bg:#e8975a #1a1a1a", f" {name}{gap}{detail} ")])
             else:
-                fragments.extend([
+                rows.append([
                     ("bg:#1a1a1a #ffffff", f" {name}"),
                     ("bg:#1a1a1a", gap),
-                    ("bg:#1a1a1a #808080", f"{date} "),
+                    ("bg:#1a1a1a #808080", f"{detail} "),
                 ])
-        return fragments
+        return rows
+
+    def render_status() -> StyleAndTextTuples:
+        return [
+            ("fg:ansigreen", "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 10) % 10]),
+            ("", " Thinking…"),
+            ("fg:#808080", f"  esc to stop · {format_elapsed(time.monotonic() - started)}"),
+            ("", "\n "),
+        ]
 
     def render_menu() -> StyleAndTextTuples:
-        return render_picker() if picking else render_suggestions()
+        if picking:
+            return join_rows(picker_rows())
+        return render_status() if waiting else render_suggestions()
 
     def menu_height() -> int:
         if picking:
-            return min(len(visible_sessions()), PICKER_ROWS) + 1 if visible_sessions() else 2
-        return max(len(suggestions()), 2)
+            return len(picker_rows())
+        return 2 if waiting else max(len(suggestions()), 2)
 
     def render_footer() -> StyleAndTextTuples:
         width = get_app().output.get_size().columns
         gap = max(2, width - get_cwidth(folder) - get_cwidth(model) - 2)
         return [("#808080", f" {folder}"), ("", " " * gap), ("#9a9a9a", f"{model} ")]
 
-    def emit(renderable: RenderableType | None = None) -> None:
-        transcript.add(Text("") if renderable is None else renderable)
+    def emit(renderable: RenderableType | None = None, on_click: Callable[[Block], None] | None = None) -> Block:
+        block = transcript.add(Text("") if renderable is None else renderable, on_click)
         get_app().invalidate()
+        return block
+
+    def toggle_group(block: Block) -> None:
+        block.renderable.expanded = not block.renderable.expanded
+        transcript.refresh(block)
+
+    def toggle_all_groups() -> None:
+        nonlocal steps_open
+        if group_blocks:
+            steps_open = not any(block.renderable.expanded for block in group_blocks)
+        else:
+            steps_open = not steps_open
+        for block in group_blocks:
+            block.renderable.expanded = steps_open
+            transcript.refresh(block)
 
     def print_change(number: int, expanded: bool = False) -> bool:
         panel, hidden = render_change(
@@ -248,17 +298,30 @@ def main(argv: list[str] | None = None) -> None:
         return bool(hidden)
 
     def render_event(event: dict) -> None:
-        nonlocal last_kind
+        nonlocal last_kind, last_group
         kind = event["t"]
-        if kind in ("text", "tool"):
-            if kind == "text" and not event["text"].strip():
+        if kind == "text":
+            if not event["text"].strip():
                 return
-            if last_kind not in (None, kind):
+            if last_kind is not None:
                 emit()
-            emit(render_answer(event["text"]) if kind == "text" else render_tool(event))
-            last_kind = kind
+            emit(render_answer(event["text"]))
+            last_kind = "text"
+            return
+        if kind == "tool":
+            if last_kind == "tool" and last_group is not None:
+                last_group.renderable.steps.append(event)
+                transcript.refresh(last_group)
+                get_app().invalidate()
+                return
+            if last_kind is not None:
+                emit()
+            last_group = emit(StepGroup(steps_open, [event]), toggle_group)
+            group_blocks.append(last_group)
+            last_kind = "tool"
             return
         last_kind = None
+        last_group = None
         if kind == "user":
             emit()
             emit(Padding(
@@ -314,49 +377,113 @@ def main(argv: list[str] | None = None) -> None:
             record({"t": "changes", "items": [asdict(change) for change in merged]})
 
     def show_banner() -> None:
-        transcript.add(Text.assemble(("Joy", "bold cyan"), f" — {MODEL}"))
+        transcript.add(Text("Joy", style="bold cyan"))
         transcript.add(Text(""))
         transcript.add(Text.assemble(
             ("Type ", "dim"), ("/", "bold"),
-            (" to see all commands · Ctrl-C cancels input · Ctrl-D exits", "dim"),
+            (" to see all commands · Ctrl-C cancels input · Ctrl-D exits · Ctrl-O shows or hides steps", "dim"),
         ))
         transcript.add(Text(""))
+
+    def reset_view() -> None:
+        nonlocal last_kind, last_group
+        transcript.clear()
+        session_changes.clear()
+        collapsed.clear()
+        group_blocks.clear()
+        pending.clear()
+        last_kind = None
+        last_group = None
+        show_banner()
 
     def load_session(chosen: Session) -> None:
         nonlocal current, history
         current = chosen
         history = [system, *chosen.messages]
-        transcript.clear()
-        session_changes.clear()
-        collapsed.clear()
-        pending.clear()
-        show_banner()
+        reset_view()
         for event in chosen.events:
             render_event(event)
         transcript.jump_to_end()
         get_app().invalidate()
 
-    def open_picker() -> None:
-        nonlocal picking, picked, all_sessions
-        all_sessions = list_sessions(workspace)
-        if not all_sessions:
-            emit(Text("No saved sessions in this folder yet.", style="dim"))
-            emit()
-            return
+    def start_new_session() -> None:
+        nonlocal current, history
+        current = None
+        history = [system]
+        reset_view()
+        get_app().invalidate()
+
+    def open_picker(
+        title: str, items: list[PickerItem], choose: Callable[[PickerItem], None],
+        note: str = "", custom: Callable[[str], PickerItem] | None = None,
+    ) -> int:
+        nonlocal picking, picked, picker_title, picker_items, picker_note, picker_choose, picker_custom, picker_id
         picking = True
         picked = 0
+        picker_title, picker_items, picker_note = title, items, note
+        picker_choose, picker_custom = choose, custom
+        picker_id += 1
+        return picker_id
 
     def close_picker() -> None:
         nonlocal picking
         picking = False
         buffer.reset()
 
-    def choose_session() -> None:
-        options = visible_sessions()
-        chosen = options[min(picked, len(options) - 1)] if options else None
+    def choose_item() -> None:
+        items = visible_items()
+        chosen = items[min(picked, len(items) - 1)] if items else None
+        choose = picker_choose
         close_picker()
-        if chosen is not None and (current is None or chosen.id != current.id):
-            load_session(chosen)
+        if chosen is not None and choose is not None:
+            choose(chosen)
+
+    def pick_session(item: PickerItem) -> None:
+        if current is None or item.value.id != current.id:
+            load_session(item.value)
+
+    def open_session_picker() -> None:
+        found = list_sessions(workspace)
+        if not found:
+            emit(Text("No saved sessions in this folder yet.", style="dim"))
+            emit()
+            return
+        open_picker("Sessions", [
+            PickerItem(session.name, format_date(session.updated), session) for session in found
+        ], pick_session)
+
+    def set_model(item: PickerItem) -> None:
+        nonlocal model
+        model = str(item.value)
+        values = load_settings()
+        values["model"] = model
+        try:
+            save_settings(values)
+        except OSError:
+            pass
+        emit(Text(f"Model set to {model}.", style="dim"))
+        emit()
+
+    async def load_models(token: int) -> None:
+        nonlocal picker_items, picker_note
+        try:
+            names = await asyncio.to_thread(list_models)
+        except Exception as error:
+            if picking and token == picker_id:
+                picker_note = f"{error} Type a model name and press Enter to use it."
+            return
+        if picking and token == picker_id:
+            names = [model, *(name for name in names if name != model)]
+            picker_items = [PickerItem(name, "current" if name == model else "", name) for name in names]
+            picker_note = ""
+            get_app().invalidate()
+
+    def open_model_picker() -> None:
+        token = open_picker(
+            "Models", [PickerItem(model, "current", model)], set_model, note="Loading models…",
+            custom=lambda text: PickerItem(f'Use "{text}"', "custom", text),
+        )
+        get_app().create_background_task(load_models(token))
 
     def expand(argument: str) -> None:
         if argument.isdigit() and 1 <= int(argument) <= len(session_changes):
@@ -385,12 +512,12 @@ def main(argv: list[str] | None = None) -> None:
                     part["error"] = event.detail
                 break
 
-    async def run_turn(messages: list[dict[str, str]]) -> None:
+    async def run_turn(messages: list[dict[str, str]], used_model: str) -> None:
         nonlocal history, waiting, answer, tokens, used_tools
         outcome = "done"
         failure: Exception | None = None
         try:
-            async with aclosing(stream_reply(messages)) as stream:
+            async with aclosing(stream_reply(messages, used_model)) as stream:
                 async for chunk in stream:
                     if isinstance(chunk, ToolEvent):
                         used_tools = True
@@ -429,7 +556,7 @@ def main(argv: list[str] | None = None) -> None:
         if closing is not None:
             record(closing)
         if outcome == "done":
-            record({"t": "footer", "model": model, "elapsed": elapsed, "tokens": tokens})
+            record({"t": "footer", "model": used_model, "elapsed": elapsed, "tokens": tokens})
         elif outcome == "cancelled":
             record({"t": "cancelled"})
         else:
@@ -448,7 +575,9 @@ def main(argv: list[str] | None = None) -> None:
         transcript.set_live(None)
         transcript.jump_to_end()
         app = get_app()
-        task = app.create_background_task(run_turn([*history, {"role": "user", "content": message}]))
+        task = app.create_background_task(
+            run_turn([*history, {"role": "user", "content": message}], model)
+        )
         app.create_background_task(tick())
 
     def handle(message: str) -> None:
@@ -463,7 +592,13 @@ def main(argv: list[str] | None = None) -> None:
             get_app().exit()
             return
         if message == "/session":
-            open_picker()
+            open_session_picker()
+            return
+        if message in ("/new", "/clear"):
+            start_new_session()
+            return
+        if message == "/model":
+            open_model_picker()
             return
         command, _, argument = message.partition(" ")
         if command == "/expand":
@@ -522,6 +657,10 @@ def main(argv: list[str] | None = None) -> None:
     def quit_joy(event: KeyPressEvent) -> None:
         event.app.exit()
 
+    @bindings.add("c-o")
+    def toggle_steps(event: KeyPressEvent) -> None:
+        toggle_all_groups()
+
     @bindings.add("escape", "enter")
     @bindings.add("c-j")
     def newline(event: KeyPressEvent) -> None:
@@ -532,18 +671,18 @@ def main(argv: list[str] | None = None) -> None:
         buffer.insert_text(event.data.replace("\r\n", "\n").replace("\r", "\n"))
 
     @bindings.add("up", filter=picking_open)
-    def previous_session(event: KeyPressEvent) -> None:
+    def previous_item(event: KeyPressEvent) -> None:
         nonlocal picked
-        picked = (picked - 1) % max(len(visible_sessions()), 1)
+        picked = (picked - 1) % max(len(visible_items()), 1)
 
     @bindings.add("down", filter=picking_open)
-    def next_session(event: KeyPressEvent) -> None:
+    def next_item(event: KeyPressEvent) -> None:
         nonlocal picked
-        picked = (picked + 1) % max(len(visible_sessions()), 1)
+        picked = (picked + 1) % max(len(visible_items()), 1)
 
     @bindings.add("enter", filter=picking_open)
-    def open_session(event: KeyPressEvent) -> None:
-        choose_session()
+    def select_item(event: KeyPressEvent) -> None:
+        choose_item()
 
     @bindings.add("escape", filter=picking_open)
     @bindings.add("c-c", filter=picking_open)
@@ -559,7 +698,9 @@ def main(argv: list[str] | None = None) -> None:
         transcript.page(-1)
 
     input_window = Window(
-        BufferControl(buffer, input_processors=[PlaceholderProcessor(lambda: "Search sessions…" if picking else "Ask Joy to do something…")]),
+        BufferControl(buffer, input_processors=[PlaceholderProcessor(
+            lambda: f"Search {picker_title.lower()}…" if picking else "Ask Joy to do something…",
+        )]),
         height=Dimension(min=1, max=INPUT_MAX_ROWS),
         wrap_lines=True,
         dont_extend_height=True,
@@ -568,18 +709,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     root = HSplit([
         Window(transcript, always_hide_cursor=True),
-        ConditionalContainer(
-            Window(FormattedTextControl(lambda: [
-                ("fg:ansigreen", "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 10) % 10]),
-                ("", " Thinking…"),
-                ("fg:#808080", f"  esc to stop · {format_elapsed(time.monotonic() - started)}"),
-            ]), height=1),
-            filter=is_waiting,
-        ),
-        ConditionalContainer(
-            Window(FormattedTextControl(render_menu), height=menu_height),
-            filter=~is_waiting,
-        ),
+        Window(FormattedTextControl(render_menu), height=menu_height),
         Frame(input_window),
         Window(FormattedTextControl(render_footer), height=1),
     ])
