@@ -15,8 +15,12 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
 from joy.cli import format_date, main
+from joy.llm import MODEL
 from joy.sessions import list_sessions, session_name
 from joy.transcript import Transcript
+
+
+FOOTER = MODEL.split(":", 1)[1] + " | "
 
 
 async def wait_for(predicate, timeout=3.0):
@@ -38,8 +42,8 @@ class CliTest(unittest.TestCase):
     def run_main(self, driver, reply=None, argv=()):
         transcripts = []
 
-        def make_transcript(*args):
-            transcripts.append(Transcript(*args))
+        def make_transcript():
+            transcripts.append(Transcript())
             return transcripts[0]
 
         failures = []
@@ -113,14 +117,14 @@ class CliTest(unittest.TestCase):
                 await original_sleep(5)
             yield "An actual "
             await original_sleep(0.02)
-            live.append(transcripts[0].live_text)
+            live.append(transcripts[0].plain())
             yield "assistant reply."
 
         async def driver(app, pipe, transcript):
             transcripts.append(transcript)
 
             async def finished(count):
-                await wait_for(lambda: transcript.plain().count("Worked for") >= count)
+                await wait_for(lambda: transcript.plain().count(FOOTER) >= count)
 
             pipe.send_text("hello\x1b\rworld\r")
             await finished(1)
@@ -129,7 +133,7 @@ class CliTest(unittest.TestCase):
             pipe.send_text("[bold]literal[/bold]\r")
             await finished(2)
             pipe.send_text("slow request\r")
-            await wait_for(lambda: "Partial slow reply." in transcript.live_text)
+            await wait_for(lambda: "Partial slow reply." in transcript.plain())
             pipe.send_text("\x1b")
             await wait_for(lambda: "Response cancelled." in transcript.plain())
             pipe.send_text("draft for later")
@@ -150,13 +154,13 @@ class CliTest(unittest.TestCase):
         self.assertIn("Partial reply before failure.", text)
         self.assertIn("Response cancelled.", text)
         self.assertEqual(text.count("An actual assistant reply."), 2)
-        self.assertIn("An actual ", live)
+        self.assertTrue(any("An actual" in text for text in live))
         self.assertEqual([m["role"] for m in requests[2]], ["system", "user", "assistant", "user"])
         self.assertEqual(requests[2][1]["content"], "hello\nworld")
         self.assertEqual(requests[2][-1]["content"], "[bold]literal[/bold]")
 
     def test_transcript_scrolls_back_and_follows_new_output(self):
-        transcript = Transcript(lambda text: text)
+        transcript = Transcript()
         for number in range(30):
             transcript.add(f"line {number}")
 
@@ -190,7 +194,7 @@ class CliTest(unittest.TestCase):
         def ask(text):
             async def driver(app, pipe, transcript):
                 pipe.send_text(text + "\r")
-                await wait_for(lambda: "Worked for" in transcript.plain())
+                await wait_for(lambda: FOOTER in transcript.plain())
             return driver
 
         folder = str(Path.cwd().resolve())
@@ -202,7 +206,7 @@ class CliTest(unittest.TestCase):
         async def follow_up(app, pipe, transcript):
             await wait_for(lambda: "Reply to beta topic." in transcript.plain())
             pipe.send_text("more detail\r")
-            await wait_for(lambda: transcript.plain().count("Worked for") == 2)
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 2)
 
         self.run_main(follow_up, fake_reply, argv=["--continue"])
         self.assertEqual([m["role"] for m in requests[-1]], ["system", "user", "assistant", "user"])
@@ -223,7 +227,7 @@ class CliTest(unittest.TestCase):
             await wait_for(lambda: "Reply to alpha topic." in transcript.plain())
             self.assertNotIn("beta topic", transcript.plain())
             pipe.send_text("again\r")
-            await wait_for(lambda: transcript.plain().count("Worked for") == 2)
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 2)
 
         self.run_main(switch, fake_reply)
         self.assertEqual(requests[-1][1]["content"], "alpha topic")

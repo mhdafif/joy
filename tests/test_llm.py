@@ -74,7 +74,7 @@ class LlmTest(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as directory:
             with patch('joy.llm.Path.cwd', return_value=Path(directory)), self.client_patch(respond):
                 chunks = [chunk async for chunk in stream_reply([{'role': 'user', 'content': 'Create it'}])]
-            self.assertEqual(chunks, [ToolEvent('write', 'running'), Change('hello.txt', 'created', '', 'hello'),
+            self.assertEqual(chunks, [ToolEvent('write', 'running', 'hello.txt'), Change('hello.txt', 'created', '', 'hello'),
                                       ToolEvent('write', 'finished'), 'Created it.'])
             self.assertEqual((Path(directory) / 'hello.txt').read_text(), 'hello')
         self.assertEqual(len(payloads), 2)

@@ -18,10 +18,30 @@ from joy.tools import Change, create_tools
 MODEL = "openai:" + os.environ.get("JOY_MODEL", "gpt-5.6-luna")
 
 
+DETAIL_LIMIT = 200
+
+
 @dataclass(frozen=True)
 class ToolEvent:
     name: str
     status: str
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class Usage:
+    tokens: int
+
+
+def _describe(arguments: str) -> str:
+    try:
+        values = json.loads(arguments)
+    except ValueError:
+        return ""
+    if not isinstance(values, dict):
+        return ""
+    text = " ".join(str(values.get("command") or values.get("path") or "").split())
+    return text if len(text) <= DETAIL_LIMIT else text[:DETAIL_LIMIT - 1] + "…"
 
 
 def _error_message(error: Exception) -> str:
@@ -59,8 +79,8 @@ def _error_message(error: Exception) -> str:
     return f"Local error: {type(error).__name__}. Check the installed dependencies and configuration."
 
 
-async def stream_reply(messages: list[dict]) -> AsyncIterator[str | ToolEvent]:
-    result: Queue[str | ToolEvent | Change | Exception | None] = Queue()
+async def stream_reply(messages: list[dict]) -> AsyncIterator[str | ToolEvent | Change | Usage]:
+    result: Queue[str | ToolEvent | Change | Usage | Exception | None] = Queue()
     cancelled = Event()
     workspace = Path.cwd()
 
@@ -95,6 +115,9 @@ async def stream_reply(messages: list[dict]) -> AsyncIterator[str | ToolEvent]:
                             raise ValueError("Empty or incomplete response")
                 if completed is None or completed.status != "completed":
                     raise ValueError("Empty or incomplete response")
+                total = getattr(getattr(completed, "usage", None), "total_tokens", None)
+                if isinstance(total, int) and total > 0:
+                    result.put(Usage(total))
                 calls = [item for item in completed.output if item.type == "function_call"]
                 if not calls:
                     if not text.strip():
@@ -108,16 +131,16 @@ async def stream_reply(messages: list[dict]) -> AsyncIterator[str | ToolEvent]:
                     if cancelled.is_set():
                         return
                     name = call.name
-                    result.put(ToolEvent(name, "running"))
+                    result.put(ToolEvent(name, "running", _describe(call.arguments)))
                     try:
                         output = toolbox.execute({"function": {
                             "name": name, "arguments": call.arguments,
                         }})[0]
-                        status = "finished"
+                        event = ToolEvent(name, "finished")
                     except Exception as error:
                         output = f"Tool error: {error}"
-                        status = "failed"
-                    result.put(ToolEvent(name, status))
+                        event = ToolEvent(name, "failed", " ".join(str(error).split())[:DETAIL_LIMIT])
+                    result.put(event)
                     conversation.append({"type": "function_call_output", "call_id": call.call_id,
                                          "output": json.dumps(output)})
                 if text:

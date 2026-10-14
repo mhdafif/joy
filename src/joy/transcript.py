@@ -1,7 +1,6 @@
 """Scrollable transcript for the full-screen interface, rendered from Rich objects."""
 
 import re
-from collections.abc import Callable
 from io import StringIO
 
 from prompt_toolkit.application import get_app
@@ -45,15 +44,14 @@ class Block:
 
 
 class Transcript(UIControl):
-    def __init__(self, live_renderer: Callable[[str], RenderableType]) -> None:
+    def __init__(self) -> None:
         self.blocks: list[Block] = []
-        self.live_renderer = live_renderer
-        self.live_text = ""
+        self.live_version = 0
         self.live_block: Block | None = None
         self.scroll_back = 0
         self.height = 24
         self.total = 0
-        self.joined_key: tuple[int, int, str] | None = None
+        self.joined_key: tuple[int, int, int] | None = None
         self.joined: list[Line] = []
 
     def add(self, renderable: RenderableType) -> None:
@@ -61,21 +59,18 @@ class Transcript(UIControl):
 
     def clear(self) -> None:
         self.blocks.clear()
-        self.live_text = ""
-        self.live_block = None
+        self.set_live(None)
         self.scroll_back = 0
         self.total = 0
         self.joined_key = None
         self.joined = []
 
-    def set_live(self, text: str) -> None:
-        if text == self.live_text:
-            return
-        self.live_text = text
-        self.live_block = Block(self.live_renderer(text)) if text.strip() else None
+    def set_live(self, renderable: RenderableType | None) -> None:
+        self.live_block = None if renderable is None else Block(renderable)
+        self.live_version += 1
 
     def lines(self, width: int) -> list[Line]:
-        key = (width, len(self.blocks), self.live_text)
+        key = (width, len(self.blocks), self.live_version)
         if key != self.joined_key:
             joined: list[Line] = []
             for block in self.blocks:

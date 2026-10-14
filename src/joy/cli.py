@@ -25,13 +25,13 @@ from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import Frame
-from rich.console import Console, RenderableType
+from rich.console import Console, Group, RenderableType
 from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.text import Text
 
 from joy.diffview import COLLAPSED_LINES, merge_changes, render_change
-from joy.llm import MODEL, ToolEvent, stream_reply
+from joy.llm import MODEL, ToolEvent, Usage, stream_reply
 from joy.sessions import Session, latest_session, list_sessions, new_session, save_session
 from joy.tools import Change
 from joy.transcript import Transcript
@@ -39,6 +39,7 @@ from joy.transcript import Transcript
 INPUT_MAX_ROWS = 10
 PICKER_ROWS = 8
 RESUME_FLAGS = ("-c", "--continue")
+TOOL_GLYPHS = {"read": ("→", "Read"), "write": ("←", "Write"), "edit": ("←", "Edit"), "bash": ("$", "")}
 NEWLINE_KEY = "Option+Enter" if sys.platform == "darwin" else "Alt+Enter"
 COMMANDS = {
     "/expand": "show a full diff",
@@ -75,8 +76,39 @@ def format_date(timestamp: float) -> str:
     return moment.strftime("%b %d, %H:%M" if moment.year == datetime.now().year else "%b %d %Y")
 
 
+def format_tokens(count: int) -> str:
+    return f"{count} tokens" if count < 1000 else f"{count / 1000:.1f}k tokens"
+
+
 def render_answer(text: str) -> RenderableType:
     return Padding(Markdown(text.lstrip()), (0, 0, 0, 1))
+
+
+def render_tool(part: dict) -> RenderableType:
+    glyph, label = TOOL_GLYPHS.get(part["name"], ("◆", part["name"]))
+    failed = part.get("status") == "failed"
+    line = Text()
+    line.append(("✗" if failed else glyph) + " ", style="red" if failed else "cyan")
+    if label:
+        line.append(label + " ", style="bold")
+    line.append(part.get("detail", ""))
+    if failed and part.get("error"):
+        line.append(" — " + part["error"], style="red")
+    return Padding(line, (0, 0, 0, 1))
+
+
+def render_parts(parts: list[dict]) -> RenderableType:
+    items: list[RenderableType] = []
+    previous = None
+    for part in parts:
+        kind = part["t"]
+        if kind == "text" and not part["text"].strip():
+            continue
+        if previous is not None and previous != kind:
+            items.append(Text(""))
+        items.append(render_answer(part["text"]) if kind == "text" else render_tool(part))
+        previous = kind
+    return Group(*items)
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -106,13 +138,15 @@ def main(argv: list[str] | None = None) -> None:
     picking = False
     picked = 0
     all_sessions: list[Session] = []
-    transcript = Transcript(render_answer)
+    transcript = Transcript()
     bindings = KeyBindings()
     waiting = False
     restart = False
     started = 0.0
     answer = ""
-    tool_status = ""
+    parts: list[dict] = []
+    tokens = 0
+    last_kind: str | None = None
     used_tools = False
     task: asyncio.Task | None = None
     pending: list[Change] = []
@@ -145,7 +179,8 @@ def main(argv: list[str] | None = None) -> None:
         width = get_app().output.get_size().columns
         rows: list[list[tuple[str, str]]] = []
         if not options:
-            rows.append([("#6b6b6b", f" Enter sends · {NEWLINE_KEY} or Ctrl+J adds a new line")])
+            rows.append([("#6b6b6b", f"Enter sends · {NEWLINE_KEY} or Ctrl+J adds a new line")])
+            rows.append([("", " ")])
         for index, command in enumerate(options):
             if index == current:
                 rows.append([("bg:#e8975a #1a1a1a", f" {command:<10} {COMMANDS[command]}".ljust(width))])
@@ -193,7 +228,7 @@ def main(argv: list[str] | None = None) -> None:
     def menu_height() -> int:
         if picking:
             return min(len(visible_sessions()), PICKER_ROWS) + 1 if visible_sessions() else 2
-        return max(len(suggestions()), 1)
+        return max(len(suggestions()), 2)
 
     def render_footer() -> StyleAndTextTuples:
         width = get_app().output.get_size().columns
@@ -213,7 +248,17 @@ def main(argv: list[str] | None = None) -> None:
         return bool(hidden)
 
     def render_event(event: dict) -> None:
+        nonlocal last_kind
         kind = event["t"]
+        if kind in ("text", "tool"):
+            if kind == "text" and not event["text"].strip():
+                return
+            if last_kind not in (None, kind):
+                emit()
+            emit(render_answer(event["text"]) if kind == "text" else render_tool(event))
+            last_kind = kind
+            return
+        last_kind = None
         if kind == "user":
             emit()
             emit(Padding(
@@ -227,6 +272,12 @@ def main(argv: list[str] | None = None) -> None:
                 session_changes.append(Change(**item))
                 if print_change(len(session_changes)):
                     collapsed.append(len(session_changes))
+            emit()
+        elif kind == "footer":
+            details = [event["model"], format_elapsed(event["elapsed"])]
+            if event.get("tokens"):
+                details.append(format_tokens(event["tokens"]))
+            emit(Padding(Text(" | ".join(details), style="dim"), (0, 0, 0, 1)))
             emit()
         elif kind == "answer":
             if event["text"].strip():
@@ -323,8 +374,19 @@ def main(argv: list[str] | None = None) -> None:
             get_app().invalidate()
             await asyncio.sleep(0.1)
 
+    def update_tool(event: ToolEvent) -> None:
+        if event.status == "running":
+            parts.append({"t": "tool", "name": event.name, "detail": event.detail, "status": "running"})
+            return
+        for part in reversed(parts):
+            if part["t"] == "tool" and part["name"] == event.name and part["status"] == "running":
+                part["status"] = event.status
+                if event.status == "failed":
+                    part["error"] = event.detail
+                break
+
     async def run_turn(messages: list[dict[str, str]]) -> None:
-        nonlocal history, waiting, answer, tool_status, used_tools
+        nonlocal history, waiting, answer, tokens, used_tools
         outcome = "done"
         failure: Exception | None = None
         try:
@@ -332,12 +394,18 @@ def main(argv: list[str] | None = None) -> None:
                 async for chunk in stream:
                     if isinstance(chunk, ToolEvent):
                         used_tools = True
-                        tool_status = f"{chunk.name} — {chunk.status}"
+                        update_tool(chunk)
                     elif isinstance(chunk, Change):
                         pending.append(chunk)
+                    elif isinstance(chunk, Usage):
+                        tokens += chunk.tokens
                     else:
                         answer += chunk
-                        transcript.set_live(answer)
+                        if parts and parts[-1]["t"] == "text":
+                            parts[-1]["text"] += chunk
+                        else:
+                            parts.append({"t": "text", "text": chunk})
+                    transcript.set_live(render_parts(parts))
                     get_app().invalidate()
         except asyncio.CancelledError:
             outcome = "cancelled"
@@ -345,7 +413,7 @@ def main(argv: list[str] | None = None) -> None:
             outcome = "failed"
             failure = error
         waiting = False
-        transcript.set_live("")
+        transcript.set_live(None)
         elapsed = time.monotonic() - started
         if outcome == "done":
             history = [*messages, {"role": "assistant", "content": answer}]
@@ -353,26 +421,31 @@ def main(argv: list[str] | None = None) -> None:
             note = "Cancelled during tool use" if outcome == "cancelled" else "Interrupted during tool use"
             history = [*messages, {"role": "assistant", "content": answer +
                 f"\n{note}. Changes may already exist; inspect before retrying."}]
+        closing = parts.pop() if parts and parts[-1]["t"] == "text" and parts[-1]["text"].strip() else None
+        for part in parts:
+            if part["t"] != "text" or part["text"].strip():
+                record(dict(part))
         show_changes()
+        if closing is not None:
+            record(closing)
         if outcome == "done":
-            record({"t": "answer", "text": answer, "elapsed": elapsed})
+            record({"t": "footer", "model": model, "elapsed": elapsed, "tokens": tokens})
+        elif outcome == "cancelled":
+            record({"t": "cancelled"})
         else:
-            if answer.strip():
-                record({"t": "answer", "text": answer, "elapsed": None})
-            if outcome == "cancelled":
-                record({"t": "cancelled"})
-            else:
-                record({"t": "error", "text": str(failure)})
+            record({"t": "error", "text": str(failure)})
 
     def start_turn(message: str) -> None:
-        nonlocal waiting, started, answer, tool_status, used_tools, task
+        nonlocal waiting, started, answer, tokens, used_tools, task
         record({"t": "user", "text": message})
         waiting = True
         started = time.monotonic()
         answer = ""
-        tool_status = ""
+        tokens = 0
         used_tools = False
+        parts.clear()
         pending.clear()
+        transcript.set_live(None)
         transcript.jump_to_end()
         app = get_app()
         task = app.create_background_task(run_turn([*history, {"role": "user", "content": message}]))
@@ -497,17 +570,11 @@ def main(argv: list[str] | None = None) -> None:
         Window(transcript, always_hide_cursor=True),
         ConditionalContainer(
             Window(FormattedTextControl(lambda: [
-                ("fg:ansicyan", f" {tool_status}" if tool_status else " "),
-                ("fg:#808080", f" esc to stop · {format_elapsed(time.monotonic() - started)}"),
-            ]), height=1),
-            filter=is_waiting,
-        ),
-        ConditionalContainer(
-            Window(FormattedTextControl(lambda: [
                 ("fg:ansigreen", "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 10) % 10]),
                 ("", " Thinking…"),
+                ("fg:#808080", f"  esc to stop · {format_elapsed(time.monotonic() - started)}"),
             ]), height=1),
-            filter=Condition(lambda: waiting and not answer.strip()),
+            filter=is_waiting,
         ),
         ConditionalContainer(
             Window(FormattedTextControl(render_menu), height=menu_height),
