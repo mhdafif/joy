@@ -1,6 +1,8 @@
 """Local coding tools. Bash runs with the current user's permissions."""
 
+import glob
 import os
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -17,6 +19,7 @@ from aisuite.utils.tools import Tools
 
 OUTPUT_LIMIT = 20_000
 FILE_LIMIT = 2_000_000
+MAX_TRACKED_FILES = 20
 # ponytail: serialize file mutations globally; use per-file locks if concurrency grows.
 MUTATION_LOCK = Lock()
 
@@ -98,6 +101,42 @@ def _save(path: Path, content: str) -> None:
             temporary.unlink(missing_ok=True)
 
 
+def _read_text(path: Path) -> str | None:
+    try:
+        if not path.is_file() or path.stat().st_size > FILE_LIMIT:
+            return None
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if b"\0" in data[:8192]:
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def _named_files(root: Path, command: str) -> dict[Path, str]:
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        tokens = command.split()
+    found: dict[Path, str] = {}
+    for token in tokens:
+        if not token or token.startswith(("-", "~")) or all(char in ";&|<>()" for char in token):
+            continue
+        matches = glob.glob(token, root_dir=root) if glob.has_magic(token) else [token]
+        for match in matches:
+            try:
+                target = (root / match).resolve()
+            except (OSError, ValueError):
+                continue
+            if target != root and target.is_relative_to(root):
+                found.setdefault(target, str(target.relative_to(root)))
+            if len(found) >= MAX_TRACKED_FILES:
+                return found
+    return found
+
+
 def create_tools(
     workspace: Path, cancelled: Event, on_change: Callable[[Change], None] | None = None,
 ) -> Tools:
@@ -136,7 +175,8 @@ def create_tools(
             if target.is_file() and target.stat().st_size <= FILE_LIMIT:
                 before = target.read_bytes().decode("utf-8", errors="replace")
             _save(target, content)
-        record(Change(path, "created" if before is None else "modified", before or "", content))
+        record(Change(str(target.relative_to(root)), "created" if before is None else "modified",
+                      before or "", content))
         return f"Wrote {path}."
 
     def edit(path: str, old_text: str, new_text: str) -> str:
@@ -155,7 +195,7 @@ def create_tools(
             if target.read_bytes().decode("utf-8") != original:
                 raise ValueError("File changed during editing. Read it and retry.")
             _save(target, updated)
-        record(Change(path, "modified", original, updated))
+        record(Change(str(target.relative_to(root)), "modified", original, updated))
         diff = "".join(unified_diff(original.splitlines(keepends=True),
                                     updated.splitlines(keepends=True),
                                     fromfile=path, tofile=path))
@@ -167,6 +207,8 @@ def create_tools(
             raise ValueError("Provide a command and a timeout between 1 and 300 seconds.")
         if cancelled.is_set():
             raise InterruptedError("Cancelled.")
+        named = _named_files(root, command)
+        before = {target: (label, target.exists(), _read_text(target)) for target, label in named.items()}
         with tempfile.TemporaryFile() as output:
             process = subprocess.Popen(
                 ["bash", "-c", command], cwd=root, stdin=subprocess.DEVNULL,
@@ -189,6 +231,15 @@ def create_tools(
                 process.wait()
             output.seek(0)
             text = output.read(OUTPUT_LIMIT + 1).decode("utf-8", errors="replace")
-            return f"{reason or 'Finished'}; exit code {process.returncode}\n{_clip(text)}"
+            result = f"{reason or 'Finished'}; exit code {process.returncode}\n{_clip(text)}"
+        for target, (label, existed, original) in before.items():
+            updated = _read_text(target)
+            if updated is None:
+                continue
+            if original is not None and updated != original:
+                record(Change(label, "modified", original, updated))
+            elif not existed:
+                record(Change(label, "created", "", updated))
+        return result
 
     return Tools([read, write, edit, bash])
