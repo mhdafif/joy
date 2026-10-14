@@ -44,7 +44,10 @@ Set these in your shell; `.env` files are not loaded automatically. Restarting w
 
 ## Usage
 
+Joy opens on its own full-screen page, like vim or OpenCode, and your terminal is restored when you exit. The conversation, diffs, and input all live on that page.
+
 - **Enter** — send a message once the current reply finishes.
+- **Page Up / Page Down** or the **mouse wheel** — scroll the conversation. New output keeps the view where it is while you read earlier messages; sending a message jumps back to the bottom.
 - **Alt+Enter** (**Option+Enter** on Mac) or **Ctrl+J** — insert a newline. Option+Enter needs your terminal to send Option as Meta (VS Code: `terminal.integrated.macOptionIsMeta`); Ctrl+J works everywhere.
 - **Ctrl+C** — cancel input or the pending reply.
 - **Esc** — stop the running reply (shown as "esc to stop" while Joy works).
@@ -52,6 +55,8 @@ Set these in your shell; `.env` files are not loaded automatically. Restarting w
 - Type **/** to see command suggestions above the input; Up/Down move, Tab fills the highlighted command, Enter runs it.
 - **/restart** — restart Joy to pick up code changes; conversation history is cleared.
 - **/expand [n]** — show the full diff of a file change that was collapsed.
+
+Joy captures the mouse for scrolling, so to select and copy text hold **Option** (Mac Terminal, iTerm2) or **Shift** (most other terminals) while dragging.
 
 Every file change from `write` or `edit` is shown as a colored diff once the reply
 finishes. Long diffs show the first 20 lines; `/expand` prints the most recent

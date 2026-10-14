@@ -1,4 +1,4 @@
-"""Exercise the real prompt loop without a physical terminal."""
+"""Exercise the real full-screen app without a physical terminal."""
 
 import asyncio
 import os
@@ -7,124 +7,162 @@ from contextlib import redirect_stdout
 from io import StringIO
 from unittest.mock import patch
 
-from prompt_toolkit import PromptSession
+from prompt_toolkit.application import Application, create_app_session
 from prompt_toolkit.formatted_text import to_plain_text
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
-from prompt_toolkit.application import create_app_session, get_app
 
 from joy.cli import main
+from joy.transcript import Transcript
+
+
+async def wait_for(predicate, timeout=3.0):
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        if asyncio.get_running_loop().time() > deadline:
+            raise AssertionError("Timed out waiting for the interface.")
+        await asyncio.sleep(0.01)
 
 
 class CliTest(unittest.TestCase):
-    def test_paste_ending_in_newline_stays_visible(self):
-        original_prompt = PromptSession.prompt
+    def run_main(self, driver, reply=None):
+        transcripts = []
+
+        def make_transcript(*args):
+            transcripts.append(Transcript(*args))
+            return transcripts[0]
+
         failures = []
-        inspected = []
         with create_pipe_input() as pipe:
-            def prompt(session, *args, **kwargs):
-                async def paste_and_inspect():
-                    pipe.send_text('\x1b[200~first line\r\nlast line\r\n\x1b[201~')
-                    await asyncio.sleep(0.05)
-                    try:
-                        self.assertEqual(session.default_buffer.text, 'first line\nlast line\n')
-                        info = session.layout.current_window.render_info
-                        visible = ''.join(
-                            to_plain_text(info.ui_content.get_line(index))
-                            for index in range(info.first_visible_line(), info.last_visible_line() + 1)
-                        )
-                        self.assertIn('first line', visible)
-                        self.assertIn('last line', visible)
-                        inspected.append(True)
-                    except AssertionError as error:
-                        failures.append(error)
-                    finally:
-                        session.app.exit(result='/exit')
+            class DrivenApplication(Application):
+                def run(self, *args, **kwargs):
+                    async def drive():
+                        try:
+                            await driver(self, pipe, transcripts[0])
+                        except BaseException as error:
+                            failures.append(error)
+                        finally:
+                            self.exit()
 
-                kwargs['pre_run'] = lambda: session.app.create_background_task(paste_and_inspect())
-                return original_prompt(session, *args, **kwargs)
+                    kwargs["pre_run"] = lambda: self.create_background_task(drive())
+                    return super().run(*args, **kwargs)
 
-            with create_app_session(input=pipe, output=DummyOutput()), \
-                    redirect_stdout(StringIO()), patch.object(PromptSession, 'prompt', prompt), \
-                    patch.dict(os.environ, {'OPENAI_API_KEY': 'test-key'}):
-                main()
+            patches = [
+                patch("joy.cli.Application", DrivenApplication),
+                patch("joy.cli.Transcript", side_effect=make_transcript),
+                patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}),
+            ]
+            if reply is not None:
+                patches.append(patch("joy.cli.stream_reply", side_effect=reply))
+            with create_app_session(input=pipe, output=DummyOutput()), redirect_stdout(StringIO()):
+                for active in patches:
+                    active.start()
+                try:
+                    main()
+                finally:
+                    for active in reversed(patches):
+                        active.stop()
         if failures:
             raise failures[0]
+        return transcripts[0]
+
+    def test_paste_ending_in_newline_stays_visible(self):
+        inspected = []
+
+        async def driver(app, pipe, transcript):
+            pipe.send_text("\x1b[200~first line\r\nlast line\r\n\x1b[201~")
+            await wait_for(lambda: app.current_buffer.text == "first line\nlast line\n")
+            await asyncio.sleep(0.05)
+            info = app.layout.current_window.render_info
+            visible = "".join(
+                to_plain_text(info.ui_content.get_line(index))
+                for index in range(info.first_visible_line(), info.last_visible_line() + 1)
+            )
+            self.assertIn("first line", visible)
+            self.assertIn("last line", visible)
+            inspected.append(True)
+
+        self.run_main(driver)
         self.assertTrue(inspected)
 
     def test_prompt_and_exit(self):
-        output = StringIO()
-        original_prompt = PromptSession.prompt
-        original_sleep = asyncio.sleep
-        inputs = iter([
-            "hello\x1b\rworld\r",
-            "\x03",
-            "failed request\r",
-            "",
-            "[bold]literal[/bold]\r",
-            "draft for later\r",
-            "\r",
-            "",
-            "/exit\r",
-        ])
-        defaults = []
-
         requests = []
+        live = []
+        original_sleep = asyncio.sleep
+        transcripts = []
 
         async def fake_reply(messages):
             requests.append(messages)
             await original_sleep(0.02)
-            if messages[-1]["content"] == "failed request":
+            content = messages[-1]["content"]
+            if content == "failed request":
                 yield "Partial reply before failure."
                 raise RuntimeError("OpenAI unavailable.")
+            if content == "slow request":
+                yield "Partial slow reply."
+                await original_sleep(5)
             yield "An actual "
             await original_sleep(0.02)
-            windows = get_app().layout.visible_windows
-            self.assertTrue(any(
-                hasattr(window.content, "text")
-                and callable(window.content.text)
-                and to_plain_text(window.content.text()) == "An actual "
-                for window in windows
-            ))
-            self.assertIn(get_app().layout.current_window, windows)
+            live.append(transcripts[0].live_text)
             yield "assistant reply."
 
-        with create_pipe_input() as pipe:
-            def prompt(session, *args, **kwargs):
-                defaults.append(kwargs.get("default", ""))
-                start = kwargs.get("pre_run")
+        async def driver(app, pipe, transcript):
+            transcripts.append(transcript)
 
-                def feed():
-                    if start:
-                        start()
-                    pipe.send_text(next(inputs))
+            async def finished(count):
+                await wait_for(lambda: transcript.plain().count("Worked for") >= count)
 
-                kwargs["pre_run"] = feed
-                return original_prompt(session, *args, **kwargs)
+            pipe.send_text("hello\x1b\rworld\r")
+            await finished(1)
+            pipe.send_text("failed request\r")
+            await wait_for(lambda: "OpenAI unavailable." in transcript.plain())
+            pipe.send_text("[bold]literal[/bold]\r")
+            await finished(2)
+            pipe.send_text("slow request\r")
+            await wait_for(lambda: "Partial slow reply." in transcript.live_text)
+            pipe.send_text("\x1b")
+            await wait_for(lambda: "Response cancelled." in transcript.plain())
+            pipe.send_text("draft for later")
+            await wait_for(lambda: app.current_buffer.text == "draft for later")
+            pipe.send_text("\x03")
+            await wait_for(lambda: app.current_buffer.text == "")
+            pipe.send_text("/exp\r")
+            await wait_for(lambda: "No file changes yet." in transcript.plain())
+            pipe.send_text("/nope\r")
+            await wait_for(lambda: "Unknown command /nope" in transcript.plain())
 
-            with create_app_session(input=pipe, output=DummyOutput()):
-                with redirect_stdout(output), patch(
-                    "joy.cli.stream_reply", side_effect=fake_reply
-                ), patch.object(PromptSession, "prompt", prompt), patch.dict(
-                    os.environ, {"OPENAI_API_KEY": "test-key"}
-                ):
-                    main()
-        self.assertIn("Joy", output.getvalue())
-        transcript = output.getvalue()
-        self.assertRegex(transcript, r"› hello\s+world")
-        self.assertIn("[bold]literal[/bold]", transcript)
-        self.assertEqual(transcript.count("› "), 4)
-        self.assertNotIn("Joy\n", transcript)
-        self.assertIn("OpenAI unavailable.", transcript)
-        self.assertIn("Partial reply before failure.", transcript)
-        self.assertIn("Response cancelled.", transcript)
-        self.assertEqual(transcript.count("An actual assistant reply."), 2)
-        self.assertEqual(defaults[6], "draft for later")
-        self.assertEqual([m["role"] for m in requests[-1]], [
-            "system", "user", "assistant", "user",
-        ])
-        self.assertEqual(requests[-1][1]["content"], "[bold]literal[/bold]")
-        self.assertEqual(requests[-1][-1]["content"], "draft for later")
+        transcript = self.run_main(driver, fake_reply)
+        text = transcript.plain()
+        self.assertIn("Joy", text)
+        self.assertRegex(text, r"› hello\s+world")
+        self.assertIn("[bold]literal[/bold]", text)
+        self.assertIn("OpenAI unavailable.", text)
+        self.assertIn("Partial reply before failure.", text)
+        self.assertIn("Response cancelled.", text)
+        self.assertEqual(text.count("An actual assistant reply."), 2)
+        self.assertIn("An actual ", live)
+        self.assertEqual([m["role"] for m in requests[2]], ["system", "user", "assistant", "user"])
+        self.assertEqual(requests[2][1]["content"], "hello\nworld")
+        self.assertEqual(requests[2][-1]["content"], "[bold]literal[/bold]")
+
+    def test_transcript_scrolls_back_and_follows_new_output(self):
+        transcript = Transcript(lambda text: text)
+        for number in range(30):
+            transcript.add(f"line {number}")
+
+        def visible(height):
+            content = transcript.create_content(40, height)
+            return [to_plain_text(content.get_line(index)) for index in range(content.line_count)]
+
+        self.assertEqual(visible(10)[-1], "line 29")
+        transcript.scroll(5)
+        self.assertEqual(visible(10)[-1], "line 24")
+        transcript.add("line 30")
+        self.assertEqual(visible(10)[-1], "line 24")
+        transcript.jump_to_end()
+        self.assertEqual(visible(10)[-1], "line 30")
+        transcript.scroll(1000)
+        self.assertEqual(visible(10)[0], "line 0")
 
     def test_missing_key(self):
         output = StringIO()
