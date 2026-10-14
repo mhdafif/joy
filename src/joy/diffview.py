@@ -12,6 +12,7 @@ from rich.text import Span, Text
 from joy.tools import Change
 
 COLLAPSED_LINES = 20
+MAX_EDITS = 2000
 NO_EOL = "\x00"
 NO_EOL_NOTE = "  ⏎ no newline at end of file"
 CONTEXT_LINES = 3
@@ -38,6 +39,126 @@ def _lines(text: str) -> list[str]:
     elif lines:
         lines[-1] += NO_EOL
     return lines
+
+
+def _myers(old: list[str], new: list[str]) -> list[tuple[str, int, int, int, int]] | None:
+    n, m = len(old), len(new)
+    limit = min(n + m, MAX_EDITS)
+    offset = limit + 1
+    v = [0] * (2 * limit + 3)
+    trace: list[list[int]] = []
+    for d in range(limit + 1):
+        trace.append(v[offset - d - 1:offset + d + 2])
+        for k in range(-d, d + 1, 2):
+            if k == -d or (k != d and v[offset + k - 1] < v[offset + k + 1]):
+                x = v[offset + k + 1]
+            else:
+                x = v[offset + k - 1] + 1
+            y = x - k
+            while x < n and y < m and old[x] == new[y]:
+                x += 1
+                y += 1
+            v[offset + k] = x
+            if x >= n and y >= m:
+                return _myers_ops(trace, n, m)
+    return None
+
+
+def _myers_ops(trace: list[list[int]], n: int, m: int) -> list[tuple[str, int, int, int, int]]:
+    steps: list[str] = []
+    x, y = n, m
+    for d in range(len(trace) - 1, -1, -1):
+        snapshot = trace[d]
+        k = x - y
+        if k == -d or (k != d and snapshot[k - 1 + d + 1] < snapshot[k + 1 + d + 1]):
+            previous_k = k + 1
+        else:
+            previous_k = k - 1
+        previous_x = snapshot[previous_k + d + 1]
+        previous_y = previous_x - previous_k
+        while x > previous_x and y > previous_y:
+            steps.append("e")
+            x -= 1
+            y -= 1
+        if d > 0:
+            steps.append("d" if x > previous_x else "i")
+        x, y = previous_x, previous_y
+    steps.reverse()
+    ops: list[tuple[str, int, int, int, int]] = []
+    i = j = 0
+    position = 0
+    while position < len(steps):
+        end = position
+        equal = steps[position] == "e"
+        while end < len(steps) and (steps[end] == "e") == equal:
+            end += 1
+        run = steps[position:end]
+        if equal:
+            ops.append(("equal", i, i + len(run), j, j + len(run)))
+            i += len(run)
+            j += len(run)
+        else:
+            deleted, inserted = run.count("d"), run.count("i")
+            tag = "replace" if deleted and inserted else "delete" if deleted else "insert"
+            ops.append((tag, i, i + deleted, j, j + inserted))
+            i += deleted
+            j += inserted
+        position = end
+    return ops
+
+
+def _opcodes(old: list[str], new: list[str]) -> list[tuple[str, int, int, int, int]]:
+    shortest = min(len(old), len(new))
+    start = 0
+    while start < shortest and old[start] == new[start]:
+        start += 1
+    end = 0
+    while end < shortest - start and old[-1 - end] == new[-1 - end]:
+        end += 1
+    old_end, new_end = len(old) - end, len(new) - end
+    ops: list[tuple[str, int, int, int, int]] = []
+    if start:
+        ops.append(("equal", 0, start, 0, start))
+    middle_old, middle_new = old[start:old_end], new[start:new_end]
+    if middle_old or middle_new:
+        if not middle_old:
+            ops.append(("insert", start, start, start, new_end))
+        elif not middle_new:
+            ops.append(("delete", start, old_end, start, start))
+        else:
+            found = _myers(middle_old, middle_new)
+            if found is None:
+                matcher = SequenceMatcher(None, middle_old, middle_new, autojunk=True)
+                found = matcher.get_opcodes()
+            ops.extend((tag, i1 + start, i2 + start, j1 + start, j2 + start)
+                       for tag, i1, i2, j1, j2 in found)
+    if end:
+        ops.append(("equal", old_end, len(old), new_end, len(new)))
+    return ops
+
+
+def _grouped(ops: list[tuple[str, int, int, int, int]]) -> list[list[tuple[str, int, int, int, int]]]:
+    if not any(tag != "equal" for tag, *_ in ops):
+        return []
+    ops = list(ops)
+    tag, i1, i2, j1, j2 = ops[0]
+    if tag == "equal":
+        ops[0] = (tag, max(i1, i2 - CONTEXT_LINES), i2, max(j1, j2 - CONTEXT_LINES), j2)
+    tag, i1, i2, j1, j2 = ops[-1]
+    if tag == "equal":
+        ops[-1] = (tag, i1, min(i2, i1 + CONTEXT_LINES), j1, min(j2, j1 + CONTEXT_LINES))
+    groups: list[list[tuple[str, int, int, int, int]]] = []
+    group: list[tuple[str, int, int, int, int]] = []
+    for tag, i1, i2, j1, j2 in ops:
+        if tag == "equal" and i2 - i1 > 2 * CONTEXT_LINES:
+            group.append((tag, i1, min(i2, i1 + CONTEXT_LINES), j1, min(j2, j1 + CONTEXT_LINES)))
+            groups.append(group)
+            group = []
+            i1, j1 = max(i1, i2 - CONTEXT_LINES), max(j1, j2 - CONTEXT_LINES)
+        group.append((tag, i1, i2, j1, j2))
+    if group:
+        groups.append(group)
+    return groups
 
 
 def _highlight(path: str, text: str) -> list[Text] | None:
@@ -68,8 +189,7 @@ def _rows(change: Change) -> list[Row]:
         return [(number, "+", line) for number, line in enumerate(new, 1)]
     old = _lines(change.before)
     rows: list[Row] = []
-    matcher = SequenceMatcher(None, old, new, autojunk=False)
-    for group in matcher.get_grouped_opcodes(CONTEXT_LINES):
+    for group in _grouped(_opcodes(old, new)):
         if rows:
             rows.append((None, GAP, ""))
         for tag, old_start, old_end, new_start, new_end in group:
