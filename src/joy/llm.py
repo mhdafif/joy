@@ -13,6 +13,7 @@ from threading import Event, Thread
 
 from openai import OpenAI, APIConnectionError, APIStatusError, APITimeoutError
 
+from joy.connections import Connection
 from joy.tools import Change, create_tools
 
 DEFAULT_MODEL = os.environ.get("JOY_MODEL", "gpt-5.6-luna")
@@ -79,8 +80,8 @@ def _error_message(error: Exception, model: str = DEFAULT_MODEL) -> str:
     return f"Local error: {type(error).__name__}. Check the installed dependencies and configuration."
 
 
-def list_models() -> list[str]:
-    client = OpenAI(timeout=15.0, max_retries=0)
+def list_models(connection: Connection | None = None) -> list[str]:
+    client = OpenAI(timeout=15.0, max_retries=0, **(connection.client_options() if connection else {}))
     try:
         return sorted({model.id for model in client.models.list()})
     except Exception as error:
@@ -90,7 +91,7 @@ def list_models() -> list[str]:
 
 
 async def stream_reply(
-    messages: list[dict], model: str | None = None,
+    messages: list[dict], model: str | None = None, connection: Connection | None = None,
 ) -> AsyncIterator[str | ToolEvent | Change | Usage]:
     model = model or DEFAULT_MODEL
     result: Queue[str | ToolEvent | Change | Usage | Exception | None] = Queue()
@@ -100,7 +101,7 @@ async def stream_reply(
     def request() -> None:
         client = None
         try:
-            client = OpenAI(timeout=60.0, max_retries=0)
+            client = OpenAI(timeout=60.0, max_retries=0, **(connection.client_options() if connection else {}))
             toolbox = create_tools(workspace, cancelled, result.put)
             conversation = list(messages)
             for _ in range(16):

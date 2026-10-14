@@ -18,39 +18,50 @@ from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
-from prompt_toolkit.layout import Dimension, HSplit, Layout, Window
+from prompt_toolkit.layout import ConditionalContainer, Dimension, Float, FloatContainer, HSplit, Layout, Window
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
-from prompt_toolkit.layout.processors import Processor, Transformation, TransformationInput
+from prompt_toolkit.layout.processors import (
+    ConditionalProcessor, PasswordProcessor, Processor, Transformation, TransformationInput,
+)
 from prompt_toolkit.output import ColorDepth
 from prompt_toolkit.styles import Style
 from prompt_toolkit.utils import get_cwidth
-from prompt_toolkit.widgets import Frame
+from prompt_toolkit.widgets import Box, Frame
 from rich.console import Console, Group, RenderableType
 from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.text import Text
 
+from joy.connections import (
+    RECENT_LIMIT, Connection, load_connections, load_recent, load_selection, save_connection, save_selection,
+)
 from joy.diffview import COLLAPSED_LINES, merge_changes, render_change
 from joy.llm import DEFAULT_MODEL, ToolEvent, Usage, list_models, stream_reply
 from joy.sessions import Session, latest_session, list_sessions, new_session, save_session
-from joy.settings import load_settings, save_settings
 from joy.steps import StepGroup
 from joy.tools import Change
 from joy.transcript import Block, Transcript
 
 INPUT_MAX_ROWS = 10
 PICKER_ROWS = 8
+MODEL_ROWS = 14
+CONNECT_STEPS = (
+    ("Group name", "for example 9router", False),
+    ("Base URL", "for example http://localhost:20128/v1", False),
+    ("API key", "sk-…", True),
+)
 RESUME_FLAGS = ("-c", "--continue")
 NEWLINE_KEY = "Option+Enter" if sys.platform == "darwin" else "Alt+Enter"
-COMMANDS = {
+COMMANDS = dict(sorted({
     "/expand": "show a full diff",
     "/session": "switch to another session",
     "/new": "start a new session",
     "/clear": "start a new session",
     "/model": "choose the model",
+    "/connect": "add an API connection",
     "/restart": "restart Joy and start a new session",
     "/exit": "quit Joy",
-}
+}.items()))
 
 
 @dataclass
@@ -58,6 +69,8 @@ class PickerItem:
     label: str
     detail: str
     value: object
+    group: str = ""
+    current: bool = False
 
 
 def format_elapsed(seconds: float) -> str:
@@ -144,11 +157,18 @@ def main(argv: list[str] | None = None) -> None:
     picking = False
     picked = 0
     picker_title = ""
-    picker_note = ""
+    picker_notes: dict[str, str] = {}
+    picker_limit = PICKER_ROWS
+    picker_order: list[str] = []
+    picker_hint: list[tuple[str, str]] = []
     picker_items: list[PickerItem] = []
     picker_choose: Callable[[PickerItem], None] | None = None
     picker_custom: Callable[[str], PickerItem] | None = None
     picker_id = 0
+    forming = False
+    form_index = 0
+    form_values: list[str] = []
+    form_error = ""
     transcript = Transcript()
     bindings = KeyBindings()
     waiting = False
@@ -171,7 +191,8 @@ def main(argv: list[str] | None = None) -> None:
     home = str(Path.home())
     if folder == home or folder.startswith(home + os.sep):
         folder = "~" + folder[len(home):]
-    model = str(load_settings().get("model") or DEFAULT_MODEL)
+    connections = load_connections()
+    connection, model = load_selection(connections, DEFAULT_MODEL)
 
     def reset_selection(_) -> None:
         nonlocal selected, picked
@@ -179,17 +200,18 @@ def main(argv: list[str] | None = None) -> None:
         picked = 0
 
     buffer = Buffer(multiline=True, history=InMemoryHistory(), on_text_changed=reset_selection)
+    modal_buffer = Buffer(on_text_changed=reset_selection)
 
     def suggestions() -> list[str]:
-        return [] if waiting or picking else matching_commands(buffer.text)
+        return [] if waiting or picking or forming else matching_commands(buffer.text)
 
     def visible_items() -> list[PickerItem]:
         if not picking:
             return []
-        query = buffer.text.strip().lower()
+        query = modal_buffer.text.strip().lower()
         items = [item for item in picker_items if query in item.label.lower()]
         if picker_custom is not None and query and not any(item.label.lower() == query for item in picker_items):
-            items.append(picker_custom(buffer.text.strip()))
+            items.append(picker_custom(modal_buffer.text.strip()))
         return items
 
     def join_rows(rows: list[list[tuple[str, str]]]) -> StyleAndTextTuples:
@@ -218,33 +240,68 @@ def main(argv: list[str] | None = None) -> None:
                 ])
         return join_rows(rows)
 
+    def modal_width() -> int:
+        return max(40, min(get_app().output.get_size().columns - 6, 76))
+
+    def title_row(title: str) -> StyleAndTextTuples:
+        gap = " " * max(1, modal_width() - 4 - get_cwidth(title) - 3)
+        return [("bold #ffffff", title), ("", gap), ("#808080", "esc")]
+
     def picker_rows() -> list[list[tuple[str, str]]]:
         items = visible_items()
-        width = get_app().output.get_size().columns
+        width = modal_width() - 4
+        searching = bool(modal_buffer.text.strip())
+        limit = max(4, min(picker_limit, get_app().output.get_size().rows - 14))
         current_index = min(picked, len(items) - 1)
-        start = max(0, min(current_index - PICKER_ROWS // 2, len(items) - PICKER_ROWS))
-        rows: list[list[tuple[str, str]]] = [[(
-            "#6b6b6b", f" {picker_title} · type to search · Enter selects · Esc closes",
-        )]]
-        if picker_note:
-            rows.append([("#808080", f" {picker_note}")])
-        elif not items:
-            rows.append([("#808080", " No matches")])
-        for index in range(start, min(len(items), start + PICKER_ROWS)):
-            detail = items[index].detail
-            name = items[index].label
-            room = max(width - get_cwidth(detail) - 4, 10)
+        entries: list[tuple[str, int, str]] = []
+        shown = [item.group for item in items]
+        wanted = set(shown) | (set() if searching else set(picker_notes))
+        groups = [group for group in picker_order if group in wanted]
+        groups += [group for group in dict.fromkeys(shown) if group not in groups]
+        for group in groups:
+            if group:
+                if entries:
+                    entries.append(("gap", -1, ""))
+                entries.append(("header", -1, group))
+            if group in picker_notes and not searching:
+                entries.append(("note", -1, picker_notes[group]))
+            entries.extend(("item", index, "") for index, item in enumerate(items) if item.group == group)
+        selected_entry = next((i for i, entry in enumerate(entries) if entry[0] == "item" and entry[1] == current_index), 0)
+        start = max(0, min(selected_entry - limit // 2, len(entries) - limit))
+        rows: list[list[tuple[str, str]]] = []
+        if not entries:
+            rows.append([("#808080", "No matches")])
+        for kind, index, text in entries[start:start + limit]:
+            if kind == "gap":
+                rows.append([("", " ")])
+                continue
+            if kind == "header":
+                rows.append([("bold #a78bfa", text)])
+                continue
+            if kind == "note":
+                rows.append([("#808080", f"  {text}")])
+                continue
+            item = items[index]
+            marker = "● " if item.current else "  "
+            name = item.label
+            room = max(width - get_cwidth(item.detail) - 4, 10)
             while get_cwidth(name) > room:
                 name = name[:-2] + "…"
-            gap = " " * max(1, width - get_cwidth(name) - get_cwidth(detail) - 2)
+            gap = " " * max(1, width - get_cwidth(name) - get_cwidth(item.detail) - 2)
             if index == current_index:
-                rows.append([("bg:#e8975a #1a1a1a", f" {name}{gap}{detail} ")])
+                rows.append([("bg:#e8975a #1a1a1a", f"{marker}{name}{gap}{item.detail}")])
             else:
-                rows.append([
-                    ("bg:#1a1a1a #ffffff", f" {name}"),
-                    ("bg:#1a1a1a", gap),
-                    ("bg:#1a1a1a #808080", f"{detail} "),
-                ])
+                label_style = "#e8975a" if item.current else "#ffffff"
+                rows.append([(label_style, f"{marker}{name}"), ("", gap), ("#808080", item.detail)])
+        return rows
+
+    def form_rows() -> list[list[tuple[str, str]]]:
+        rows: list[list[tuple[str, str]]] = [
+            [("#808080", f"{CONNECT_STEPS[index][0]}  "), ("#d4d4d4", value)]
+            for index, value in enumerate(form_values)
+        ]
+        label, _, _ = CONNECT_STEPS[form_index]
+        rows.append([("bold #a78bfa", label), ("#808080", f"  step {form_index + 1} of {len(CONNECT_STEPS)}")])
         return rows
 
     def render_status() -> StyleAndTextTuples:
@@ -256,19 +313,20 @@ def main(argv: list[str] | None = None) -> None:
         ]
 
     def render_menu() -> StyleAndTextTuples:
-        if picking:
-            return join_rows(picker_rows())
         return render_status() if waiting else render_suggestions()
 
     def menu_height() -> int:
-        if picking:
-            return len(picker_rows())
         return 2 if waiting else max(len(suggestions()), 2)
 
     def render_footer() -> StyleAndTextTuples:
         width = get_app().output.get_size().columns
-        gap = max(2, width - get_cwidth(folder) - get_cwidth(model) - 2)
-        return [("#808080", f" {folder}"), ("", " " * gap), ("#9a9a9a", f"{model} ")]
+        source = connection.name if len(connections) > 1 else ""
+        used = get_cwidth(model) + (get_cwidth(source) + 1 if source else 0)
+        gap = max(2, width - get_cwidth(folder) - used - 2)
+        fragments = [("#808080", f" {folder}"), ("", " " * gap), ("#9a9a9a", model)]
+        if source:
+            fragments.append(("#6b6b6b", f" {source}"))
+        return [*fragments, ("", " ")]
 
     def emit(renderable: RenderableType | None = None, on_click: Callable[[Block], None] | None = None) -> Block:
         block = transcript.add(Text("") if renderable is None else renderable, on_click)
@@ -415,20 +473,28 @@ def main(argv: list[str] | None = None) -> None:
 
     def open_picker(
         title: str, items: list[PickerItem], choose: Callable[[PickerItem], None],
-        note: str = "", custom: Callable[[str], PickerItem] | None = None,
+        notes: dict[str, str] | None = None, custom: Callable[[str], PickerItem] | None = None,
+        limit: int = PICKER_ROWS, order: list[str] | None = None,
+        hint: list[tuple[str, str]] | None = None,
     ) -> int:
-        nonlocal picking, picked, picker_title, picker_items, picker_note, picker_choose, picker_custom, picker_id
+        nonlocal picking, picked, picker_title, picker_items, picker_notes, picker_choose
+        nonlocal picker_custom, picker_id, picker_limit, picker_order, picker_hint
         picking = True
         picked = 0
-        picker_title, picker_items, picker_note = title, items, note
-        picker_choose, picker_custom = choose, custom
+        picker_title, picker_items, picker_notes = title, items, dict(notes or {})
+        picker_choose, picker_custom, picker_limit = choose, custom, limit
+        picker_order = list(order or [])
+        picker_hint = hint or []
         picker_id += 1
+        modal_buffer.reset()
+        get_app().layout.focus(picker_input)
         return picker_id
 
     def close_picker() -> None:
         nonlocal picking
         picking = False
-        buffer.reset()
+        modal_buffer.reset()
+        get_app().layout.focus(input_window)
 
     def choose_item() -> None:
         items = visible_items()
@@ -450,40 +516,125 @@ def main(argv: list[str] | None = None) -> None:
             return
         open_picker("Sessions", [
             PickerItem(session.name, format_date(session.updated), session) for session in found
-        ], pick_session)
+        ], pick_session, hint=[("bold #ffffff", "Enter"), ("#808080", " to open")])
 
     def set_model(item: PickerItem) -> None:
-        nonlocal model
-        model = str(item.value)
-        values = load_settings()
-        values["model"] = model
+        nonlocal connection, model
+        name, chosen = item.value
+        found = next((entry for entry in connections if entry.name == name), None)
+        if found is None:
+            emit(Text(f"Connection {name} no longer exists.", style="red"))
+            emit()
+            return
+        connection, model = found, chosen
         try:
-            save_settings(values)
+            save_selection(connection, model)
         except OSError:
             pass
-        emit(Text(f"Model set to {model}.", style="dim"))
+        via = f" via {connection.name}" if len(connections) > 1 else ""
+        emit(Text(f"Model set to {model}{via}.", style="dim"))
         emit()
 
-    async def load_models(token: int) -> None:
-        nonlocal picker_items, picker_note
+    def model_item(entry: Connection, name: str, group: str) -> PickerItem:
+        is_current = entry.name == connection.name and name == model
+        return PickerItem(name, entry.name if group == "Recent" else "", (entry.name, name), group, is_current)
+
+    def recent_items() -> list[PickerItem]:
+        known = {entry.name: entry for entry in connections}
+        pairs = [(connection.name, model)]
+        pairs += [pair for pair in load_recent() if pair != pairs[0]]
+        return [model_item(known[name], chosen, "Recent") for name, chosen in pairs[:RECENT_LIMIT] if name in known]
+
+    async def load_models(token: int, entry: Connection) -> None:
+        nonlocal picker_items
         try:
-            names = await asyncio.to_thread(list_models)
+            names = await asyncio.to_thread(list_models, entry)
         except Exception as error:
             if picking and token == picker_id:
-                picker_note = f"{error} Type a model name and press Enter to use it."
+                picker_notes[entry.name] = f"Could not load models: {error}"
+                get_app().invalidate()
             return
         if picking and token == picker_id:
-            names = [model, *(name for name in names if name != model)]
-            picker_items = [PickerItem(name, "current" if name == model else "", name) for name in names]
-            picker_note = ""
+            picker_notes.pop(entry.name, None)
+            picker_items = [
+                *(item for item in picker_items if item.group != entry.name),
+                *(model_item(entry, name, entry.name) for name in names),
+            ]
             get_app().invalidate()
 
     def open_model_picker() -> None:
         token = open_picker(
-            "Models", [PickerItem(model, "current", model)], set_model, note="Loading models…",
-            custom=lambda text: PickerItem(f'Use "{text}"', "custom", text),
+            "Select model", recent_items(), set_model,
+            notes={entry.name: "Loading models…" for entry in connections},
+            custom=lambda text: PickerItem(f'Use "{text}"', f"with {connection.name}", (connection.name, text), "Custom"),
+            limit=MODEL_ROWS, order=["Recent", *(entry.name for entry in connections), "Custom"],
+            hint=[("bold #ffffff", "Connect an integration"), ("#808080", " ctrl+a")],
         )
-        get_app().create_background_task(load_models(token))
+        for entry in connections:
+            get_app().create_background_task(load_models(token, entry))
+
+    def finish_connect() -> None:
+        nonlocal connections, forming
+        forming = False
+        modal_buffer.reset()
+        get_app().layout.focus(input_window)
+        name, base_url, api_key = form_values
+        entry = Connection(name, base_url, api_key)
+        try:
+            replaced = save_connection(entry)
+        except OSError as error:
+            emit(Text(f"Could not save the connection: {error}", style="red"))
+            emit()
+            return
+        connections = load_connections()
+        emit(Text(f"{'Updated' if replaced else 'Connected'} {name}. Checking its models…", style="dim"))
+        get_app().create_background_task(check_connection(entry))
+
+    async def check_connection(entry: Connection) -> None:
+        try:
+            names = await asyncio.to_thread(list_models, entry)
+        except Exception as error:
+            emit(Text(f"Saved, but the model list could not be loaded: {error} Use /model and type a model name if the endpoint has no list.", style="dim"))
+        else:
+            emit(Text(f"{entry.name} offers {len(names)} models. Use /model to pick one.", style="dim"))
+        emit()
+
+    def open_connect() -> None:
+        nonlocal forming, form_index, form_values, form_error
+        forming = True
+        form_index = 0
+        form_values = []
+        form_error = ""
+        modal_buffer.reset()
+        get_app().layout.focus(form_input)
+
+    def advance_connect() -> None:
+        nonlocal form_index, form_error
+        value = modal_buffer.text.strip()
+        label = CONNECT_STEPS[form_index][0]
+        if not value:
+            form_error = f"{label} cannot be empty."
+            return
+        if form_index == 1:
+            value = value.rstrip("/")
+            if not value.startswith(("http://", "https://")):
+                form_error = "Base URL must start with http:// or https://."
+                return
+        form_error = ""
+        form_values.append(value)
+        modal_buffer.reset()
+        if form_index + 1 == len(CONNECT_STEPS):
+            finish_connect()
+        else:
+            form_index += 1
+
+    def cancel_connect() -> None:
+        nonlocal forming
+        forming = False
+        modal_buffer.reset()
+        get_app().layout.focus(input_window)
+        emit(Text("Connection cancelled.", style="dim"))
+        emit()
 
     def expand(argument: str) -> None:
         if argument.isdigit() and 1 <= int(argument) <= len(session_changes):
@@ -512,12 +663,12 @@ def main(argv: list[str] | None = None) -> None:
                     part["error"] = event.detail
                 break
 
-    async def run_turn(messages: list[dict[str, str]], used_model: str) -> None:
+    async def run_turn(messages: list[dict[str, str]], used_model: str, used_connection: Connection) -> None:
         nonlocal history, waiting, answer, tokens, used_tools
         outcome = "done"
         failure: Exception | None = None
         try:
-            async with aclosing(stream_reply(messages, used_model)) as stream:
+            async with aclosing(stream_reply(messages, used_model, used_connection)) as stream:
                 async for chunk in stream:
                     if isinstance(chunk, ToolEvent):
                         used_tools = True
@@ -576,7 +727,7 @@ def main(argv: list[str] | None = None) -> None:
         transcript.jump_to_end()
         app = get_app()
         task = app.create_background_task(
-            run_turn([*history, {"role": "user", "content": message}], model)
+            run_turn([*history, {"role": "user", "content": message}], model, connection)
         )
         app.create_background_task(tick())
 
@@ -600,6 +751,9 @@ def main(argv: list[str] | None = None) -> None:
         if message == "/model":
             open_model_picker()
             return
+        if message == "/connect":
+            open_connect()
+            return
         command, _, argument = message.partition(" ")
         if command == "/expand":
             expand(argument.strip())
@@ -615,6 +769,9 @@ def main(argv: list[str] | None = None) -> None:
     is_waiting = Condition(lambda: waiting)
     is_empty = Condition(lambda: not buffer.text)
     picking_open = Condition(lambda: picking)
+    forming_open = Condition(lambda: forming)
+    modal_open = Condition(lambda: picking or forming)
+    model_picking = Condition(lambda: picking and picker_title == "Select model")
 
     @bindings.add("up", filter=menu_open)
     def previous_suggestion(event: KeyPressEvent) -> None:
@@ -653,7 +810,7 @@ def main(argv: list[str] | None = None) -> None:
         if task is not None:
             task.cancel()
 
-    @bindings.add("c-d", filter=is_empty)
+    @bindings.add("c-d", filter=is_empty & ~modal_open)
     def quit_joy(event: KeyPressEvent) -> None:
         event.app.exit()
 
@@ -661,14 +818,20 @@ def main(argv: list[str] | None = None) -> None:
     def toggle_steps(event: KeyPressEvent) -> None:
         toggle_all_groups()
 
-    @bindings.add("escape", "enter")
-    @bindings.add("c-j")
+    @bindings.add("escape", "enter", filter=~modal_open)
+    @bindings.add("c-j", filter=~modal_open)
     def newline(event: KeyPressEvent) -> None:
         buffer.insert_text("\n")
 
     @bindings.add("<bracketed-paste>")
     def paste(event: KeyPressEvent) -> None:
-        buffer.insert_text(event.data.replace("\r\n", "\n").replace("\r", "\n"))
+        target = modal_buffer if picking or forming else buffer
+        target.insert_text(event.data.replace("\r\n", "\n").replace("\r", "").replace("\n", " " if picking or forming else "\n"))
+
+    @bindings.add("c-a", filter=model_picking)
+    def connect_from_picker(event: KeyPressEvent) -> None:
+        close_picker()
+        open_connect()
 
     @bindings.add("up", filter=picking_open)
     def previous_item(event: KeyPressEvent) -> None:
@@ -689,6 +852,15 @@ def main(argv: list[str] | None = None) -> None:
     def dismiss_picker(event: KeyPressEvent) -> None:
         close_picker()
 
+    @bindings.add("enter", filter=forming_open)
+    def next_step(event: KeyPressEvent) -> None:
+        advance_connect()
+
+    @bindings.add("escape", filter=forming_open)
+    @bindings.add("c-c", filter=forming_open)
+    def dismiss_form(event: KeyPressEvent) -> None:
+        cancel_connect()
+
     @bindings.add("pageup")
     def scroll_up(event: KeyPressEvent) -> None:
         transcript.page(1)
@@ -698,21 +870,68 @@ def main(argv: list[str] | None = None) -> None:
         transcript.page(-1)
 
     input_window = Window(
-        BufferControl(buffer, input_processors=[PlaceholderProcessor(
-            lambda: f"Search {picker_title.lower()}…" if picking else "Ask Joy to do something…",
-        )]),
+        BufferControl(buffer, input_processors=[PlaceholderProcessor(lambda: "Ask Joy to do something…")]),
         height=Dimension(min=1, max=INPUT_MAX_ROWS),
         wrap_lines=True,
         dont_extend_height=True,
         style="bg:#393939 #ffffff",
         get_line_prefix=lambda line, wrap: "› " if line == 0 and wrap == 0 else "  ",
     )
-    root = HSplit([
-        Window(transcript, always_hide_cursor=True),
-        Window(FormattedTextControl(render_menu), height=menu_height),
-        Frame(input_window),
-        Window(FormattedTextControl(render_footer), height=1),
+
+    def modal_input(placeholder: Callable[[], str], secret: Condition | None = None) -> Window:
+        processors = [PlaceholderProcessor(placeholder)]
+        if secret is not None:
+            processors.insert(0, ConditionalProcessor(PasswordProcessor(), secret))
+        return Window(BufferControl(modal_buffer, input_processors=processors), height=1)
+
+    def blank() -> Window:
+        return Window(height=1)
+
+    def text_window(render: Callable[[], StyleAndTextTuples], height: int | Callable[[], int] = 1) -> Window:
+        return Window(FormattedTextControl(render), height=height)
+
+    picker_input = modal_input(lambda: "Search")
+    form_input = modal_input(
+        lambda: CONNECT_STEPS[form_index][1],
+        Condition(lambda: forming and CONNECT_STEPS[form_index][2]),
+    )
+    picker_modal = HSplit([
+        text_window(lambda: title_row(picker_title)),
+        blank(),
+        picker_input,
+        blank(),
+        text_window(lambda: join_rows(picker_rows()), lambda: max(len(picker_rows()), 1)),
+        blank(),
+        text_window(lambda: picker_hint),
     ])
+    form_modal = HSplit([
+        text_window(lambda: title_row("Connect an integration")),
+        blank(),
+        text_window(lambda: join_rows(form_rows()), lambda: len(form_rows())),
+        form_input,
+        text_window(lambda: [("#f87171", form_error or " ")]),
+        blank(),
+        text_window(lambda: [("bold #ffffff", "Enter"), ("#808080", " to continue")]),
+    ])
+
+    def modal_float(body: HSplit, active: Condition) -> Float:
+        return Float(
+            content=ConditionalContainer(
+                Box(body, padding_left=2, padding_right=2, padding_top=1, padding_bottom=1, style="bg:#1a1a1a"),
+                filter=active,
+            ),
+            width=modal_width,
+        )
+
+    root = FloatContainer(
+        content=HSplit([
+            Window(transcript, always_hide_cursor=True),
+            Window(FormattedTextControl(render_menu), height=menu_height),
+            Frame(input_window),
+            Window(FormattedTextControl(render_footer), height=1),
+        ]),
+        floats=[modal_float(picker_modal, picking_open), modal_float(form_modal, forming_open)],
+    )
     app: Application[None] = Application(
         layout=Layout(root, focused_element=input_window),
         key_bindings=bindings,
