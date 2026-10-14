@@ -59,6 +59,15 @@ class Transcript(UIControl):
     def add(self, renderable: RenderableType) -> None:
         self.blocks.append(Block(renderable))
 
+    def clear(self) -> None:
+        self.blocks.clear()
+        self.live_text = ""
+        self.live_block = None
+        self.scroll_back = 0
+        self.total = 0
+        self.joined_key = None
+        self.joined = []
+
     def set_live(self, text: str) -> None:
         if text == self.live_text:
             return

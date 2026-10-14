@@ -2,9 +2,11 @@
 
 import asyncio
 import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 from prompt_toolkit.application import Application, create_app_session
@@ -12,7 +14,8 @@ from prompt_toolkit.formatted_text import to_plain_text
 from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 
-from joy.cli import main
+from joy.cli import format_date, main
+from joy.sessions import list_sessions, session_name
 from joy.transcript import Transcript
 
 
@@ -25,7 +28,14 @@ async def wait_for(predicate, timeout=3.0):
 
 
 class CliTest(unittest.TestCase):
-    def run_main(self, driver, reply=None):
+    def setUp(self):
+        self.home = tempfile.TemporaryDirectory()
+        self.addCleanup(self.home.cleanup)
+        environment = patch.dict(os.environ, {"JOY_HOME": self.home.name})
+        environment.start()
+        self.addCleanup(environment.stop)
+
+    def run_main(self, driver, reply=None, argv=()):
         transcripts = []
 
         def make_transcript(*args):
@@ -58,7 +68,7 @@ class CliTest(unittest.TestCase):
                 for active in patches:
                     active.start()
                 try:
-                    main()
+                    main(list(argv))
                 finally:
                     for active in reversed(patches):
                         active.stop()
@@ -167,5 +177,65 @@ class CliTest(unittest.TestCase):
     def test_missing_key(self):
         output = StringIO()
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}), redirect_stdout(output):
-            main()
+            main([])
         self.assertIn("Set OPENAI_API_KEY", output.getvalue())
+
+    def test_sessions_are_saved_continued_and_switched(self):
+        requests = []
+
+        async def fake_reply(messages):
+            requests.append(messages)
+            yield "Reply to " + messages[-1]["content"] + "."
+
+        def ask(text):
+            async def driver(app, pipe, transcript):
+                pipe.send_text(text + "\r")
+                await wait_for(lambda: "Worked for" in transcript.plain())
+            return driver
+
+        folder = str(Path.cwd().resolve())
+        self.run_main(ask("alpha topic"), fake_reply)
+        self.run_main(ask("beta topic"), fake_reply)
+        saved = list_sessions(folder)
+        self.assertEqual([session.name for session in saved], ["beta topic", "alpha topic"])
+
+        async def follow_up(app, pipe, transcript):
+            await wait_for(lambda: "Reply to beta topic." in transcript.plain())
+            pipe.send_text("more detail\r")
+            await wait_for(lambda: transcript.plain().count("Worked for") == 2)
+
+        self.run_main(follow_up, fake_reply, argv=["--continue"])
+        self.assertEqual([m["role"] for m in requests[-1]], ["system", "user", "assistant", "user"])
+        self.assertEqual(requests[-1][1]["content"], "beta topic")
+        self.assertEqual(requests[-1][-1]["content"], "more detail")
+        saved = list_sessions(folder)
+        self.assertEqual(len(saved), 2)
+        self.assertEqual(saved[0].name, "beta topic")
+        self.assertEqual(len(saved[0].messages), 4)
+
+        async def switch(app, pipe, transcript):
+            self.assertNotIn("alpha topic", transcript.plain())
+            pipe.send_text("/session\r")
+            await asyncio.sleep(0.1)
+            pipe.send_text("alpha")
+            await asyncio.sleep(0.1)
+            pipe.send_text("\r")
+            await wait_for(lambda: "Reply to alpha topic." in transcript.plain())
+            self.assertNotIn("beta topic", transcript.plain())
+            pipe.send_text("again\r")
+            await wait_for(lambda: transcript.plain().count("Worked for") == 2)
+
+        self.run_main(switch, fake_reply)
+        self.assertEqual(requests[-1][1]["content"], "alpha topic")
+        self.assertEqual(len(list_sessions(folder)), 2)
+
+    def test_continue_without_a_session_starts_fresh(self):
+        async def driver(app, pipe, transcript):
+            await wait_for(lambda: "No earlier session" in transcript.plain())
+
+        self.run_main(driver, argv=["-c"])
+
+    def test_session_name_and_date(self):
+        self.assertEqual(session_name("  fix   the\nbug  "), "fix the bug")
+        self.assertEqual(len(session_name("x" * 200)), 80)
+        self.assertRegex(format_date(1_700_000_000), r"^\w{3} \d{2}( \d{4}|, \d{2}:\d{2})$")
