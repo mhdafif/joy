@@ -206,18 +206,18 @@ def main() -> None:
                 ("fg:ansigreen", "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 10) % 10]),
                 ("", " Thinking…"),
             ]), height=2),
-            filter=Condition(lambda: waiting and not answer),
+            filter=Condition(lambda: waiting and not answer.strip()),
         ),
         ConditionalContainer(
             HSplit([
                 Window(FormattedTextControl(
-                    lambda: [("", answer), ("[SetCursorPosition]", "")],
+                    lambda: [("", answer.lstrip()), ("[SetCursorPosition]", "")],
                     show_cursor=False,
                 ), wrap_lines=True, height=Dimension(max=12), dont_extend_height=True,
                     get_line_prefix=lambda line, wrap: " "),
                 Window(height=1),
             ]),
-            filter=Condition(lambda: waiting and bool(answer)),
+            filter=Condition(lambda: waiting and bool(answer.strip())),
         ),
         ConditionalContainer(
             Window(FormattedTextControl(render_suggestions), height=lambda: max(len(suggestions()), 1)),
@@ -298,7 +298,7 @@ def main() -> None:
             except KeyboardInterrupt:
                 draft = session.default_buffer.text
                 show_changes()
-                if answer:
+                if answer.strip():
                     console.print(Padding(Markdown(answer), (0, 0, 0, 1)))
                 console.print("[dim]Response cancelled.[/dim]\n")
                 if used_tools:
@@ -307,13 +307,13 @@ def main() -> None:
                 continue
             except EOFError:
                 show_changes()
-                if answer:
+                if answer.strip():
                     console.print(Padding(Markdown(answer), (0, 0, 0, 1)))
                 break
             except Exception as error:
                 draft = session.default_buffer.text
                 show_changes()
-                if answer:
+                if answer.strip():
                     console.print(Padding(Markdown(answer), (0, 0, 0, 1)))
                 console.print(Text(str(error), style="red"))
                 if used_tools:
