@@ -35,6 +35,11 @@ COMMANDS = {
 }
 
 
+def format_elapsed(seconds: float) -> str:
+    whole = int(seconds)
+    return f"{whole}s" if whole < 60 else f"{whole // 60}m {whole % 60:02d}s"
+
+
 def matching_commands(text: str) -> list[str]:
     if not text.startswith("/") or any(char.isspace() for char in text):
         return []
@@ -61,6 +66,7 @@ def main() -> None:
     answer = ""
     bindings = KeyBindings()
     waiting = False
+    started = 0.0
     draft = ""
     tool_status = ""
     used_tools = False
@@ -197,7 +203,7 @@ def main() -> None:
         ConditionalContainer(
             Window(FormattedTextControl(lambda: [
                 ("fg:ansicyan", f" {tool_status}" if tool_status else " "),
-                ("fg:#808080", " esc to stop"),
+                ("fg:#808080", f" esc to stop · {format_elapsed(time.monotonic() - started)}"),
             ]), height=1),
             filter=Condition(lambda: waiting),
         ),
@@ -284,6 +290,7 @@ def main() -> None:
             ))
             console.print()
             waiting = True
+            started = time.monotonic()
             answer = ""
             tool_status = ""
             used_tools = False
@@ -325,4 +332,8 @@ def main() -> None:
             history = [*messages, {"role": "assistant", "content": answer}]
             show_changes()
             console.print(Padding(Markdown(answer), (0, 0, 0, 1)))
+            console.print(Padding(
+                Text(f"Worked for {format_elapsed(time.monotonic() - started)}", style="dim"),
+                (0, 0, 0, 1),
+            ))
             console.print()
