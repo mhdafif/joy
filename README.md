@@ -88,7 +88,7 @@ Joy opens on its own full-screen page, like vim or OpenCode, and your terminal i
 - **/model** — choose the model in a centered window (Ctrl+A inside it jumps to `/connect`). Models are grouped by connection, with the most recent picks in a **Recent** group at the top and `●` marking the one in use. Joy lists what each endpoint offers (`GET /v1/models`); type to search, Enter to select. If a list cannot be loaded, or the model is not listed, type its name and press Enter to use it with the current connection. The choice is saved and the current model (and connection, when you have more than one) is shown at the bottom right.
 - **/connect** — add another endpoint. Joy asks for a group name, a base URL, and an API key (hidden while you type), checks that it can list models, and saves it. Using the same group name again updates that connection. The connection from `OPENAI_BASE_URL` / `OPENAI_API_KEY` always exists as **Default**.
 - **Ctrl+O** — show or hide the details of every step. You can also click a step summary to open or close just that one.
-- **/restart** — restart Joy to pick up code changes and start a fresh session; the old one stays saved.
+- **/restart** — restart Joy to pick up code changes and reopen the last session in this folder, with its messages and diffs.
 
 Joy captures the mouse for scrolling, so to select and copy text hold **Option** (Mac Terminal, iTerm2) or **Shift** (most other terminals) while dragging.
 

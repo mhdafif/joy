@@ -108,7 +108,7 @@ COMMANDS = dict(sorted({
     "/clear": "start a new session",
     "/model": "choose the model",
     "/connect": "add an API connection",
-    "/restart": "restart Joy and start a new session",
+    "/restart": "restart Joy and reopen the last session",
     "/exit": "quit Joy",
 }.items()))
 
@@ -141,6 +141,10 @@ def matching_commands(text: str, table: dict[str, str] | None = None) -> list[st
     if not text.startswith("/") or any(char.isspace() for char in text):
         return []
     return [command for command in (table or COMMANDS) if command.startswith(text)]
+
+
+def restart_arguments(original: list[str]) -> list[str]:
+    return [*(argument for argument in original if argument not in RESUME_FLAGS), "--continue"]
 
 
 def format_count(count: int) -> str:
@@ -1777,4 +1781,4 @@ def main(argv: list[str] | None = None) -> None:
     if restart:
         console.print("[dim]Restarting Joy…[/dim]")
         sys.stdout.flush()
-        os.execv(sys.executable, [argument for argument in sys.orig_argv if argument not in RESUME_FLAGS])
+        os.execv(sys.executable, restart_arguments(sys.orig_argv))

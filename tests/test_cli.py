@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -113,6 +114,37 @@ class CliTest(CliCase):
         self.assertEqual(visible(10)[-1], "line 30")
         transcript.scroll(1000)
         self.assertEqual(visible(10)[0], "line 0")
+
+    def test_restart_reopens_the_last_session(self):
+        from joy.cli import restart_arguments
+
+        self.assertEqual(
+            restart_arguments(["python", "-m", "joy", "--theme", "moss", "-c"]),
+            ["python", "-m", "joy", "--theme", "moss", "--continue"],
+        )
+        self.assertEqual(restart_arguments(["joy"]), ["joy", "--continue"])
+
+        async def fake_reply(messages, model=None, connection=None, readonly=False, *args, **kwargs):
+            yield "Reply to " + messages[-1]["content"] + "."
+
+        async def driver(app, pipe, transcript):
+            pipe.send_text("remember me\r")
+            await wait_for(lambda: FOOTER in transcript.plain())
+            pipe.send_text("/restart\r")
+            try:
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                return
+
+        with patch("joy.cli.os.execv") as execv, patch("sys.orig_argv", ["python", "-m", "joy"]):
+            self.run_main(driver, fake_reply)
+        execv.assert_called_once()
+        self.assertEqual(execv.call_args.args[1], ["python", "-m", "joy", "--continue"])
+
+        async def reopened(app, pipe, transcript):
+            await wait_for(lambda: "Reply to remember me." in transcript.plain())
+
+        self.run_main(reopened, fake_reply, argv=["--continue"])
 
     def test_missing_key(self):
         output = StringIO()
