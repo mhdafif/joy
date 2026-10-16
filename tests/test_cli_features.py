@@ -517,11 +517,11 @@ class ApprovalTest(CliCase):
 
             await ask("\r", 1)
             self.assertNotIn("allowed_commands", load_settings())
-            await ask(DOWN + "\r", 2)
-            self.assertEqual(load_settings()["allowed_commands"], ["touch b"])
+            await ask(DOWN + DOWN + "\r", 2)
+            self.assertEqual(load_settings()["allowed_commands"], [{"prefix": "touch b"}])
             await ask(None, 3)
             await ask(ESCAPE, 4)
-            await ask(DOWN + DOWN + "\r", 5)
+            await ask(DOWN + "\r", 5)
             await ask(None, 6)
 
         self.run_main(driver, replies)
@@ -529,6 +529,56 @@ class ApprovalTest(CliCase):
             ("touch a", True), ("touch b", True), ("touch b", True),
             ("touch c", False), ("touch d", True), ("touch e", True),
         ])
+
+    def test_always_allow_saves_a_prefix_that_covers_the_variants_but_not_chained_commands(self):
+        outcomes = []
+
+        def turn(command):
+            async def behave(call):
+                decision = Decision()
+                yield Approval("bash", command, decision)
+                while not decision.event.is_set():
+                    await asyncio.sleep(0.01)
+                outcomes.append((command, decision.allowed))
+                yield "ok"
+            return behave
+
+        commands = [
+            'python -m unittest 2>&1; echo "EXIT:$?"', 'python -m unittest -v 2>&1',
+            'python -m unittest 2>&1 | tail -5', 'python -m unittest; touch x',
+        ]
+        replies = Replies(*[turn(command) for command in commands])
+
+        def panel(app):
+            for window in app.layout.find_all_windows():
+                control = window.content
+                if isinstance(control, FormattedTextControl) and callable(control.text):
+                    text = to_plain_text(control.text())
+                    if "Allow this command?" in text:
+                        return text
+            return ""
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "go")
+            await wait_for(lambda: len(replies.calls) == 1)
+            await wait_for(lambda: "Allow this command?" in panel(app))
+            self.assertIn("Always allow python -m unittest …", panel(app))
+            pipe.send_text("3")
+            await wait_for(lambda: len(outcomes) == 1)
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            self.assertEqual(load_settings()["allowed_commands"], [{"prefix": "python -m unittest"}])
+            for number in (2, 3):
+                await say(pipe, "go")
+                await wait_for(lambda: len(outcomes) == number)
+                await wait_for(lambda: transcript.plain().count(FOOTER) == number)
+            await say(pipe, "go")
+            await wait_for(lambda: len(replies.calls) == 4)
+            await wait_for(lambda: "Allow this command?" in panel(app))
+            pipe.send_text(ESCAPE)
+            await wait_for(lambda: len(outcomes) == 4)
+
+        self.run_main(driver, replies)
+        self.assertEqual([allowed for _, allowed in outcomes], [True, True, True, False])
 
     def test_allow_all_ends_with_the_session(self):
         outcomes = []
@@ -549,7 +599,7 @@ class ApprovalTest(CliCase):
             await say(pipe, "go")
             await wait_for(lambda: len(replies.calls) == 1)
             await settle(0.25)
-            pipe.send_text(DOWN + DOWN + "\r")
+            pipe.send_text(DOWN + "\r")
             await wait_for(lambda: len(outcomes) == 1)
             await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
             await say(pipe, "go")
@@ -599,7 +649,7 @@ class ApprovalTest(CliCase):
             await settle(0.2)
             shown = to_plain_text(prompt(app))
             self.assertIn("rm -rf build", shown)
-            for number, label in enumerate(["Allow once", "Always allow this exact command", "Allow all commands this session", "Deny"], 1):
+            for number, label in enumerate(["Allow once", "Allow all commands this session", "Always allow this exact command", "Deny"], 1):
                 self.assertIn(f"{number}  {label}", shown)
             self.assertEqual(window.render_info.window_height, before)
             pipe.send_text("typed")

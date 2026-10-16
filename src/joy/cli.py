@@ -42,6 +42,7 @@ from joy.connections import (
     DEFAULT_NAME, RECENT_LIMIT, Connection, load_connections, load_recent, load_selection, remove_connection,
     save_connection, save_selection,
 )
+from joy.approvals import is_allowed, suggest_prefix
 from joy.clipboard import copy_text, osc52
 from joy.export import to_markdown
 from joy.instructions import load_instructions
@@ -66,8 +67,8 @@ MENTION_ROWS = 8
 SUGGESTION_ROWS = 5
 APPROVAL_CHOICES = (
     ("once", "Allow once"),
-    ("always", "Always allow this exact command"),
     ("session", "Allow all commands this session"),
+    ("always", "Always allow this exact command"),
     ("deny", "Deny"),
 )
 PLAN_NOTE = "Plan mode: no files changed."
@@ -319,7 +320,7 @@ def main(argv: list[str] | None = None) -> None:
     picker_searchable = True
     picker_dismiss: Callable[[], None] | None = None
     approve_all = False
-    approval: tuple[str, Callable[[str], None]] | None = None
+    approval: tuple[str, Callable[[str], None], list[str] | None] | None = None
     approval_index = 0
     context_tokens = 0
     status_label = "Thinking…"
@@ -1135,18 +1136,20 @@ def main(argv: list[str] | None = None) -> None:
 
     def request_approval(request: Approval) -> None:
         nonlocal approve_all, status_label
-        allowed_before = load_settings().get("allowed_commands", [])
-        if approve_all or request.detail in allowed_before:
+        rules = load_settings().get("allowed_commands", [])
+        if approve_all or is_allowed(Path(workspace), request.detail, rules):
             request.decision.resolve(True)
             return
         status_label = "Waiting for your approval…"
+        prefix = suggest_prefix(Path(workspace), request.detail)
 
         def decide(value: str) -> None:
             nonlocal approve_all, status_label
             status_label = "Thinking…"
             if value == "always":
                 values = load_settings()
-                values["allowed_commands"] = [*values.get("allowed_commands", []), request.detail]
+                rule = {"prefix": " ".join(prefix)} if prefix else request.detail
+                values["allowed_commands"] = [*values.get("allowed_commands", []), rule]
                 try:
                     save_settings(values)
                 except OSError:
@@ -1156,7 +1159,7 @@ def main(argv: list[str] | None = None) -> None:
             request.decision.resolve(value != "deny")
 
         nonlocal approval, approval_index
-        approval = (request.detail, decide)
+        approval = (request.detail, decide, prefix)
         approval_index = 0
         get_app().invalidate()
 
@@ -1179,6 +1182,8 @@ def main(argv: list[str] | None = None) -> None:
         rows: list[list[tuple]] = [[(t.row_skill, " Allow this command?".ljust(width))]]
         rows.extend([(t.row, f"  {line}".ljust(width))] for line in lines)
         for index, (value, label) in enumerate(APPROVAL_CHOICES):
+            if value == "always" and approval[2]:
+                label = f"Always allow {' '.join(approval[2])} …"
             def pick(mouse_event: MouseEvent, value=value, index=index):
                 nonlocal approval_index
                 if mouse_event.event_type == MouseEventType.MOUSE_MOVE:
