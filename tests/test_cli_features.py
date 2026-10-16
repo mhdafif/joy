@@ -9,6 +9,7 @@ from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 
 from harness import DOWN, ESCAPE, FOOTER, UP, CliCase, Replies, last_user_text, settle, wait_for
+from joy.connections import DEFAULT_NAME, Connection, load_connections, save_connection, save_selection
 from joy.llm import Approval, Decision, ToolEvent
 from joy.settings import load_settings
 from joy.sessions import list_sessions, new_session, save_session
@@ -666,7 +667,36 @@ class UndoTest(CliCase):
 
 
 class ConnectionsAndSettingsTest(CliCase):
+    def test_disconnect_asks_for_confirmation_and_cleans_up(self):
+        entry = Connection("r1", "http://127.0.0.1:9/v1", "sk-test")
+        save_connection(entry)
+        save_selection(entry, "m1")
 
+        async def driver(app, pipe, transcript):
+            await say(pipe, "/disconnect")
+            await settle(0.25)
+            pipe.send_text("\r")
+            await settle(0.25)
+            pipe.send_text(DOWN + "\r")
+            await settle(0.25)
+            self.assertEqual(len(load_connections()), 2)
+            await say(pipe, "/disconnect")
+            await settle(0.25)
+            pipe.send_text("\r")
+            await settle(0.25)
+            pipe.send_text("\r")
+            await wait_for(lambda: "Removed r1 and its saved API key." in transcript.plain())
+
+        self.run_main(driver, Replies())
+        self.assertEqual([c.name for c in load_connections()], [DEFAULT_NAME])
+        self.assertNotIn("selection", load_settings())
+
+    def test_disconnect_with_nothing_saved_says_so(self):
+        async def driver(app, pipe, transcript):
+            await say(pipe, "/disconnect")
+            await wait_for(lambda: "no saved connections" in transcript.plain())
+
+        self.run_main(driver, Replies())
 
     def test_connecting_then_choosing_a_model_sends_requests_to_that_connection(self):
         replies = Replies()

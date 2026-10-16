@@ -1,3 +1,5 @@
+"""Sessions, settings, connections, undo, and export, against a temporary home folder."""
+
 import os
 import tempfile
 import unittest
@@ -6,12 +8,12 @@ from unittest.mock import patch
 
 from joy import sessions
 from joy.connections import (
-    DEFAULT_NAME, Connection, load_connections, load_recent, load_selection, save_connection, save_selection,
+    DEFAULT_NAME, Connection, load_connections, load_recent, load_selection, remove_connection,
+    save_connection, save_selection,
 )
 from joy.export import to_markdown
 from joy.settings import load_settings, save_settings
 from joy.undo import revert_change
-"""Sessions, settings, connections, undo, and export, against a temporary home folder."""
 
 
 class HomeCase(unittest.TestCase):
@@ -82,6 +84,16 @@ class ConnectionTest(HomeCase):
         self.assertEqual(load_recent()[0], ('r', 'm1'))
         self.assertEqual(len(load_recent()), 5)
         self.assertEqual(load_selection([Connection(DEFAULT_NAME)], 'dflt'), (Connection(DEFAULT_NAME), 'dflt'))
+
+    def test_removing_a_connection_cleans_up_after_it(self):
+        entry = Connection('r', 'http://x/v1', 'k')
+        save_connection(entry)
+        save_selection(entry, 'm1')
+        self.assertTrue(remove_connection('R'))
+        self.assertFalse(remove_connection('r'))
+        values = load_settings()
+        self.assertEqual((values['connections'], values['recent']), ([], []))
+        self.assertNotIn('selection', values)
 
 
 class UndoTest(unittest.TestCase):

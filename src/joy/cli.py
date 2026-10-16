@@ -39,7 +39,8 @@ from rich.table import Table
 from rich.text import Text
 
 from joy.connections import (
-    RECENT_LIMIT, Connection, load_connections, load_recent, load_selection, save_connection, save_selection,
+    DEFAULT_NAME, RECENT_LIMIT, Connection, load_connections, load_recent, load_selection, remove_connection,
+    save_connection, save_selection,
 )
 from joy.clipboard import copy_text, osc52
 from joy.export import to_markdown
@@ -96,6 +97,7 @@ COMPACT_REQUEST = (
 COMMANDS = dict(sorted({
     "/expand": "show a full diff",
     "/compact": "summarize the conversation to free up context",
+    "/disconnect": "remove a saved API connection",
     "/export": "save this session as a Markdown file",
     "/undo": "undo a task: revert its file changes and rewind the chat",
     "/build": "build mode: Joy can change files",
@@ -1329,6 +1331,36 @@ def main(argv: list[str] | None = None) -> None:
             emit(Text(f"Saved this session to {target}", style="dim"))
         emit()
 
+    def finish_disconnect(entry: Connection, choice: PickerItem) -> None:
+        nonlocal connections, connection, model
+        if choice.value != "remove":
+            return
+        if remove_connection(entry.name):
+            connections = load_connections()
+            if connection.name.lower() == entry.name.lower():
+                connection, model = load_selection(connections, DEFAULT_MODEL)
+            emit(Text(f"Removed {entry.name} and its saved API key.", style="dim"))
+        else:
+            emit(Text(f"{entry.name} was not found.", style="dim"))
+        emit()
+
+    def confirm_disconnect(item: PickerItem) -> None:
+        entry = item.value
+        open_picker(
+            "Remove connection?", [PickerItem("Remove", "", "remove"), PickerItem("Cancel", "", "cancel")],
+            lambda choice: finish_disconnect(entry, choice), searchable=False,
+            subtitle=f"{entry.name} · {entry.base_url}\nThis deletes its saved API key.",
+            hint=[(t.strong, "Enter"), (t.muted, " to choose · Esc cancels")],
+        )
+
+    def open_disconnect() -> None:
+        saved = [entry for entry in connections if entry.name != DEFAULT_NAME]
+        if not saved:
+            emit(Text("There are no saved connections to remove.", style="dim"))
+            emit()
+            return
+        open_picker("Disconnect", [PickerItem(entry.name, entry.base_url, entry) for entry in saved], confirm_disconnect)
+
     def set_mode(new_mode: str) -> None:
         nonlocal mode
         if new_mode == mode:
@@ -1374,6 +1406,9 @@ def main(argv: list[str] | None = None) -> None:
             return
         if message == "/connect":
             open_connect()
+            return
+        if message == "/disconnect":
+            open_disconnect()
             return
         if message == "/compact":
             start_compact()

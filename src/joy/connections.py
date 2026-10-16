@@ -87,3 +87,21 @@ def save_selection(connection: Connection, model: str) -> None:
         for name, chosen in [(connection.name, model), *recent][:RECENT_LIMIT]
     ]
     save_settings(values)
+
+
+def remove_connection(name: str) -> bool:
+    values = load_settings()
+    items = [item for item in values.get("connections", []) if isinstance(item, dict)]
+    kept = [item for item in items if str(item.get("name", "")).lower() != name.lower()]
+    if len(kept) == len(items):
+        return False
+    values["connections"] = kept
+    values["recent"] = [
+        item for item in values.get("recent", [])
+        if isinstance(item, dict) and str(item.get("connection", "")).lower() != name.lower()
+    ]
+    selection = values.get("selection")
+    if isinstance(selection, dict) and str(selection.get("connection", "")).lower() == name.lower():
+        values.pop("selection")
+    save_settings(values)
+    return True
