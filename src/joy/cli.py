@@ -219,6 +219,8 @@ def main(argv: list[str] | None = None) -> None:
         items = [item for item in picker_items if query in item.label.lower()]
         if picker_custom is not None and query and not any(item.label.lower() == query for item in picker_items):
             items.append(picker_custom(modal_buffer.text.strip()))
+        rank = {group: index for index, group in enumerate(picker_order)}
+        items.sort(key=lambda item: rank.get(item.group, len(rank)))
         return items
 
     def join_rows(rows: list[list[tuple[str, str]]]) -> StyleAndTextTuples:
