@@ -2,84 +2,20 @@
 
 import asyncio
 import os
-import tempfile
-import unittest
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-from prompt_toolkit.application import Application, create_app_session
 from prompt_toolkit.formatted_text import to_plain_text
-from prompt_toolkit.input import create_pipe_input
-from prompt_toolkit.output import DummyOutput
 
+from harness import FOOTER, CliCase, wait_for
 from joy.cli import format_date, main
-from joy.llm import MODEL
 from joy.sessions import list_sessions, session_name
 from joy.transcript import Transcript
 
 
-FOOTER = MODEL.split(":", 1)[1] + " | "
-
-
-async def wait_for(predicate, timeout=3.0):
-    deadline = asyncio.get_running_loop().time() + timeout
-    while not predicate():
-        if asyncio.get_running_loop().time() > deadline:
-            raise AssertionError("Timed out waiting for the interface.")
-        await asyncio.sleep(0.01)
-
-
-class CliTest(unittest.TestCase):
-    def setUp(self):
-        self.home = tempfile.TemporaryDirectory()
-        self.addCleanup(self.home.cleanup)
-        environment = patch.dict(os.environ, {"JOY_HOME": self.home.name})
-        environment.start()
-        self.addCleanup(environment.stop)
-
-    def run_main(self, driver, reply=None, argv=()):
-        transcripts = []
-
-        def make_transcript():
-            transcripts.append(Transcript())
-            return transcripts[0]
-
-        failures = []
-        with create_pipe_input() as pipe:
-            class DrivenApplication(Application):
-                def run(self, *args, **kwargs):
-                    async def drive():
-                        try:
-                            await driver(self, pipe, transcripts[0])
-                        except BaseException as error:
-                            failures.append(error)
-                        finally:
-                            self.exit()
-
-                    kwargs["pre_run"] = lambda: self.create_background_task(drive())
-                    return super().run(*args, **kwargs)
-
-            patches = [
-                patch("joy.cli.Application", DrivenApplication),
-                patch("joy.cli.Transcript", side_effect=make_transcript),
-                patch.dict(os.environ, {"OPENAI_API_KEY": "test-key"}),
-            ]
-            if reply is not None:
-                patches.append(patch("joy.cli.stream_reply", side_effect=reply))
-            with create_app_session(input=pipe, output=DummyOutput()), redirect_stdout(StringIO()):
-                for active in patches:
-                    active.start()
-                try:
-                    main(list(argv))
-                finally:
-                    for active in reversed(patches):
-                        active.stop()
-        if failures:
-            raise failures[0]
-        return transcripts[0]
-
+class CliTest(CliCase):
     def test_paste_ending_in_newline_stays_visible(self):
         inspected = []
 
