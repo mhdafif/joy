@@ -89,7 +89,6 @@ Joy opens on its own full-screen page, like vim or OpenCode, and your terminal i
 - **/connect** — add another endpoint. Joy asks for a group name, a base URL, and an API key (hidden while you type), checks that it can list models, and saves it. Using the same group name again updates that connection. The connection from `OPENAI_BASE_URL` / `OPENAI_API_KEY` always exists as **Default**.
 - **Ctrl+O** — show or hide the details of every step. You can also click a step summary to open or close just that one.
 - **/restart** — restart Joy to pick up code changes and start a fresh session; the old one stays saved.
-- **/expand [n]** — show the full diff of a file change that was collapsed.
 
 Joy captures the mouse for scrolling, so to select and copy text hold **Option** (Mac Terminal, iTerm2) or **Shift** (most other terminals) while dragging.
 
@@ -98,8 +97,8 @@ Every step Joy takes is printed in the conversation as it happens, for example `
 Every file change from `write` or `edit` is shown as a colored diff once the reply
 finishes. Changes made through `bash` are shown too when the command names the file
 (for example `sed -i … file`, `> file`, `tee file`); files a script changes without
-being named in the command are not detected. Long diffs show the first 20 lines; `/expand` prints the most recent
-collapsed one, or `/expand 3` a specific change by its number.
+being named in the command are not detected. Long diffs show the first 20 lines; click `… n more lines · click to expand` on the
+bottom border to open the whole diff in place, and click `click to collapse` to fold it again.
 
 ### Sessions
 

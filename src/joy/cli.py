@@ -17,7 +17,7 @@ from typing import NamedTuple
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.filters import Condition
-from prompt_toolkit.formatted_text import StyleAndTextTuples
+from prompt_toolkit.formatted_text import StyleAndTextTuples, fragment_list_to_text
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
@@ -45,7 +45,7 @@ from joy.connections import (
 from joy.clipboard import copy_text, osc52
 from joy.export import to_markdown
 from joy.instructions import load_instructions
-from joy.diffview import COLLAPSED_LINES, merge_changes, render_change
+from joy.diffview import COLLAPSE_LABEL, COLLAPSED_LINES, EXPAND_LABEL, merge_changes, render_change
 from joy.mentions import (
     active_mention, expand as expand_mentions, mentioned_skills, references, search as search_paths, workspace_paths,
 )
@@ -95,7 +95,6 @@ COMPACT_REQUEST = (
     "results, open problems, and next steps. Be specific and concise, with no preamble."
 )
 COMMANDS = dict(sorted({
-    "/expand": "show a full diff",
     "/compact": "summarize the conversation to free up context",
     "/disconnect": "remove a saved API connection",
     "/export": "save this session as a Markdown file",
@@ -342,7 +341,8 @@ def main(argv: list[str] | None = None) -> None:
     task: asyncio.Task | None = None
     pending: list[Change] = []
     session_changes: list[Change] = []
-    collapsed: list[int] = []
+    change_blocks: dict[int, Block] = {}
+    expanded_changes: set[int] = set()
     selected = 0
     suggestion_top = 0
     queue: list[str] = []
@@ -637,13 +637,43 @@ def main(argv: list[str] | None = None) -> None:
             block.renderable.expanded = steps_open
             transcript.refresh(block)
 
-    def print_change(number: int, expanded: bool = False) -> bool:
-        panel, hidden = render_change(
-            session_changes[number - 1], number, None if expanded else COLLAPSED_LINES,
+    def change_view(number: int, state: str = "idle") -> RenderableType:
+        opened = number in expanded_changes
+        panel, _ = render_change(
+            session_changes[number - 1], None if opened else COLLAPSED_LINES, state == "hover", opened,
         )
+        return Padding(panel, (0, 0, 0, 1))
+
+    def toggle_change(number: int) -> None:
+        expanded_changes.symmetric_difference_update({number})
+        transcript.refresh(change_blocks[number])
+        get_app().invalidate()
+
+    def change_hit(number: int) -> Callable[[Block, int, int], bool]:
+        def hit(block: Block, row: int, column: int) -> bool:
+            if row != len(block.lines) - 1:
+                return False
+            opened = number in expanded_changes
+            label = COLLAPSE_LABEL if opened else EXPAND_LABEL
+            text = fragment_list_to_text(block.lines[row])
+            at = text.find(label)
+            if at < 0:
+                return True
+            start = at if opened else max(text.rfind("…", 0, at), 0)
+            return start <= column < at + len(label)
+
+        return hit
+
+    def print_change(number: int) -> None:
+        _, hidden = render_change(session_changes[number - 1])
         emit()
-        emit(Padding(panel, (0, 0, 0, 1)))
-        return bool(hidden)
+        if not hidden:
+            emit(change_view(number))
+            return
+        change_blocks[number] = emit(
+            change_view(number), lambda block, number=number: toggle_change(number),
+            lambda state, number=number: change_view(number, state), change_hit(number),
+        )
 
     def render_event(event: dict) -> None:
         nonlocal last_kind, last_group
@@ -683,6 +713,7 @@ def main(argv: list[str] | None = None) -> None:
         elif kind == "changes":
             for item in event["items"]:
                 session_changes.append(Change(**item))
+                print_change(len(session_changes))
             emit()
         elif kind == "compact":
             emit(Text(f"↺ Conversation compacted: ~{format_count(event['before'])} → ~{format_count(event['after'])} tokens", style="dim"))
@@ -768,7 +799,8 @@ def main(argv: list[str] | None = None) -> None:
         nonlocal last_kind, last_group
         transcript.clear()
         session_changes.clear()
-        collapsed.clear()
+        change_blocks.clear()
+        expanded_changes.clear()
         group_blocks.clear()
         pending.clear()
         last_kind = None
@@ -1076,17 +1108,6 @@ def main(argv: list[str] | None = None) -> None:
         modal_buffer.reset()
         get_app().layout.focus(input_window)
         emit(Text("Connection cancelled.", style="dim"))
-        emit()
-
-    def expand(argument: str) -> None:
-        if argument.isdigit() and 1 <= int(argument) <= len(session_changes):
-            print_change(int(argument), expanded=True)
-        elif not argument and collapsed:
-            print_change(collapsed[-1], expanded=True)
-        elif not session_changes:
-            emit(Text("No file changes yet.", style="dim"))
-        else:
-            emit(Text(f"Usage: /expand [1-{len(session_changes)}]", style="dim"))
         emit()
 
     async def tick() -> None:
@@ -1422,9 +1443,6 @@ def main(argv: list[str] | None = None) -> None:
                 open_task_modal(None, last)
             return
         command, _, argument = message.partition(" ")
-        if command == "/expand":
-            expand(argument.strip())
-            transcript.jump_to_end()
         if command == "/export":
             export_session(argument.strip())
             return

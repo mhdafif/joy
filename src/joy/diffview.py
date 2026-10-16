@@ -212,7 +212,17 @@ def merge_changes(changes: list[Change]) -> list[Change]:
     return list(merged.values())
 
 
-def render_change(change: Change, number: int, limit: int | None = COLLAPSED_LINES) -> tuple[Panel, int]:
+EXPAND_LABEL = "click to expand"
+COLLAPSE_LABEL = "click to collapse"
+
+
+def hidden_label(hidden: int) -> str:
+    return f"… {hidden} more lines · {EXPAND_LABEL}"
+
+
+def render_change(
+    change: Change, limit: int | None = COLLAPSED_LINES, hover: bool = False, collapsible: bool = False,
+) -> tuple[Panel, int]:
     row_styles = {"+": t.add_row, "-": t.remove_row, " ": ""}
     sign_styles = {"+": t.add_sign, "-": t.remove_sign, " ": ""}
     number_styles = {"+": t.gutter, "-": t.gutter, " ": t.faint}
@@ -225,7 +235,8 @@ def render_change(change: Change, number: int, limit: int | None = COLLAPSED_LIN
     )
     shown = rows if limit is None else rows[:limit]
     hidden = len(rows) - len(shown)
-    subtitle = Text(f"… {hidden} more lines · /expand {number}", style="dim") if hidden else None
+    note = hidden_label(hidden) if hidden else COLLAPSE_LABEL if collapsible else ""
+    subtitle = Text(note, style=t.text_soft if hover else "dim") if note else None
     if not rows:
         message = "(empty file)" if change.kind == "created" and not change.after else "(no changes)" if change.before == change.after else "(line endings changed)"
         body: Table | Text = Text(message, style="dim")

@@ -1,3 +1,5 @@
+"""Diff rows, newline handling, and panel rendering."""
+
 import random
 import unittest
 
@@ -5,11 +7,10 @@ from rich.console import Console
 
 from joy.diffview import GAP, _opcodes, _rows, merge_changes, render_change
 from joy.tools import Change
-"""Diff rows, newline handling, and panel rendering."""
 
 
 def render_text(change, **options):
-    panel, hidden = render_change(change, 1, **options)
+    panel, hidden = render_change(change, **options)
     console = Console(width=80, force_terminal=False, color_system=None)
     with console.capture() as capture:
         console.print(panel)
@@ -57,7 +58,7 @@ class DiffTest(unittest.TestCase):
         self.assertEqual(sum(1 for _, sign, _ in rows if sign == '+'), 2)
         text, hidden = render_text(Change('big.txt', 'created', '', before), limit=5)
         self.assertEqual(hidden, 35)
-        self.assertIn('35 more lines', text)
+        self.assertIn('35 more lines · click to expand', text)
 
     def test_empty_and_unchanged_messages(self):
         self.assertIn('(empty file)', render_text(Change('e.txt', 'created', '', ''))[0])

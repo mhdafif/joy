@@ -1,4 +1,7 @@
+"""Feature behavior of the full-screen app: queue, modes, approvals, undo, compact, and more."""
+
 import asyncio
+import json
 import re
 from pathlib import Path
 from unittest.mock import patch
@@ -16,7 +19,6 @@ from joy.sessions import list_sessions, new_session, save_session
 from joy.theme import active
 from joy.tools import Change
 from joy.transcript import Transcript
-"""Feature behavior of the full-screen app: queue, modes, approvals, undo, compact, and more."""
 
 
 async def say(pipe, text):
@@ -185,6 +187,38 @@ class ModesAndContextTest(CliCase):
         self.assertIn("read-only", system)
         self.assertIn("Press Tab to switch to Build", system)
         self.assertIn("never say that yourself", system)
+
+    def test_a_long_diff_expands_and_collapses_when_its_label_is_clicked(self):
+        body = "".join(f"line {number}\n" for number in range(1, 41))
+
+        async def reply(call):
+            yield Change("big.txt", "created", "", body)
+            yield "made it"
+
+        def click_at(app, transcript, needle, offset=0):
+            width = app.output.get_size().columns
+            lines = [to_plain_text(line) for line in transcript.lines(width)]
+            index = max(i for i, line in enumerate(lines) if needle in line)
+            row = index - max(0, len(lines) - transcript.height) + 1
+            return f"\x1b[<0;{lines[index].index(needle) + 1 + offset};{row}m"
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "make big.txt")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            self.assertIn("more lines · click to expand", transcript.plain())
+            self.assertNotIn("line 40", transcript.plain())
+            pipe.send_text(click_at(app, transcript, "more lines", 60))
+            await settle(0.2)
+            self.assertNotIn("line 40", transcript.plain())
+            pipe.send_text(click_at(app, transcript, "more lines"))
+            await wait_for(lambda: "line 40" in transcript.plain())
+            self.assertIn("click to collapse", transcript.plain())
+            self.assertNotIn("click to expand", transcript.plain())
+            pipe.send_text(click_at(app, transcript, "click to collapse"))
+            await wait_for(lambda: "line 40" not in transcript.plain())
+            self.assertIn("more lines · click to expand", transcript.plain())
+
+        self.run_main(driver, Replies(reply))
 
     def test_welcome_page_instructions_and_skill_commands(self):
         Path("AGENTS.md").write_text("Always answer in haiku.\n")
