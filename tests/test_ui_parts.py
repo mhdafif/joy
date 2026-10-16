@@ -11,7 +11,7 @@ from rich.console import Console
 from rich.text import Text
 
 from joy import clipboard, theme
-from joy.cli import format_date, format_elapsed, format_tokens, render_user
+from joy.cli import ReferenceProcessor, format_date, format_elapsed, format_tokens, matching_commands, render_user
 from joy.markdown import JoyMarkdown
 from joy.steps import StepGroup, summarize
 from joy.transcript import Transcript, render_lines
@@ -192,11 +192,47 @@ class SmallHelpersTest(unittest.TestCase):
         self.assertEqual((format_tokens(842), format_tokens(12_345)), ('842 tokens', '12.3k tokens'))
         self.assertRegex(format_date(1_700_000_000), r'^\w{3} \d{2}( \d{4}|, \d{2}:\d{2})$')
 
+    def test_command_matching_is_alphabetical_and_ignores_arguments(self):
+        names = matching_commands('/')
+        self.assertEqual(names, sorted(names))
+        self.assertEqual(matching_commands('/mo'), ['/model'])
+        self.assertEqual(matching_commands('/model now'), [])
+        self.assertEqual(matching_commands('hello'), [])
+        self.assertEqual(matching_commands('/de', {'/demo': 'x', '/other': 'y'}), ['/demo'])
+
     def test_your_messages_show_a_hint_when_hovered_or_copied(self):
         self.assertNotIn('click', render_plain(render_user('hi', 'idle')))
         self.assertIn('click for options', render_plain(render_user('hi', 'hover')))
         self.assertIn('copied ✓', render_plain(render_user('hi', 'copied')))
         self.assertIn('copy failed', render_plain(render_user('hi', 'failed')))
+
+    def test_skills_and_files_in_a_message_and_in_the_input_use_their_own_theme_colors(self):
+        theme.use('ember')
+        palette = theme.PALETTES['ember']
+        find = lambda text: [(4, 10, 'skill'), (14, 22, 'file')] if text.startswith('run @a') else []
+        lines = render_lines(render_user('run @alpha on @calc.py ok', 'idle', find), 60)
+        chars = [(style, character) for line in lines for style, text, *_ in line for character in text]
+        joined = ''.join(character for _, character in chars)
+
+        def style_of(word):
+            start = joined.index(word)
+            return {style for style, _ in chars[start:start + len(word)]}
+
+        self.assertEqual(len(style_of('@alpha')), 1)
+        self.assertIn(palette.secondary, style_of('@alpha').pop())
+        self.assertIn(palette.info, style_of('@calc.py').pop())
+        self.assertNotIn(palette.info, style_of('on').pop())
+        from prompt_toolkit.document import Document
+        from prompt_toolkit.layout.processors import TransformationInput
+        document = Document('run @alpha on @calc.py ok')
+        result = ReferenceProcessor(find).apply_transformation(
+            TransformationInput(None, document, 0, 0, [('', document.text)], 80, 24)
+        ).fragments
+        self.assertEqual(''.join(text for _, text in result), document.text)
+        by_text = {text: style for style, text in result}
+        self.assertIn(palette.secondary, by_text['@alpha'])
+        self.assertIn(palette.info, by_text['@calc.py'])
+        self.assertEqual(by_text['run '], '')
 
 
 class ClipboardTest(unittest.TestCase):

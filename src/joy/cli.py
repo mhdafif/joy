@@ -12,6 +12,7 @@ from contextlib import aclosing
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import NamedTuple
 
 from prompt_toolkit.application import Application, get_app
 from prompt_toolkit.buffer import Buffer
@@ -42,6 +43,9 @@ from joy.connections import (
 )
 from joy.clipboard import copy_text, osc52
 from joy.diffview import COLLAPSED_LINES, merge_changes, render_change
+from joy.mentions import (
+    active_mention, expand as expand_mentions, references, search as search_paths, workspace_paths,
+)
 from joy.markdown import JoyMarkdown
 from joy.llm import DEFAULT_MODEL, ToolEvent, Usage, list_models, stream_reply
 from joy.settings import load_settings, save_settings
@@ -53,6 +57,8 @@ from joy.transcript import Block, Transcript
 
 INPUT_MAX_ROWS = 10
 PICKER_ROWS = 8
+MENTION_ROWS = 8
+SUGGESTION_ROWS = 5
 PLAN_NOTE = "Plan mode: no files changed."
 PLAN_NOTE_REDUNDANT = re.compile(r"read-only|no files (were |have been )?(changed|modified)|nothing (was|has been) changed", re.I)
 MODEL_ROWS = 14
@@ -78,6 +84,12 @@ COMMANDS = dict(sorted({
 }.items()))
 
 
+class Suggestion(NamedTuple):
+    text: str
+    detail: str
+    kind: str
+
+
 @dataclass
 class PickerItem:
     label: str
@@ -96,10 +108,10 @@ def format_tokens(count: int) -> str:
     return f"{count} tokens" if count < 1000 else f"{count / 1000:.1f}k tokens"
 
 
-def matching_commands(text: str) -> list[str]:
+def matching_commands(text: str, table: dict[str, str] | None = None) -> list[str]:
     if not text.startswith("/") or any(char.isspace() for char in text):
         return []
-    return [command for command in COMMANDS if command.startswith(text)]
+    return [command for command in (table or COMMANDS) if command.startswith(text)]
 
 
 class PlaceholderProcessor(Processor):
@@ -122,8 +134,47 @@ def render_answer(text: str) -> RenderableType:
     return Padding(JoyMarkdown(text.lstrip()), (0, 0, 0, 1))
 
 
-def render_user(text: str, state: str = "idle") -> RenderableType:
-    body = Text("› " + text.replace("\n", "\n  "))
+REFERENCE_STYLES = {"skill": lambda: t.skill_ref, "file": lambda: t.file_ref}
+
+
+class ReferenceProcessor(Processor):
+    def __init__(self, find: Callable[[str], list[tuple[int, int, str]]]) -> None:
+        self.find = find
+
+    def apply_transformation(self, transformation_input: TransformationInput) -> Transformation:
+        line = transformation_input.document.lines[transformation_input.lineno]
+        spans = self.find(line)
+        if not spans:
+            return Transformation(transformation_input.fragments)
+        result: StyleAndTextTuples = []
+        offset = 0
+        for style, text, *rest in transformation_input.fragments:
+            position = 0
+            while position < len(text):
+                absolute = offset + position
+                span = next((span for span in spans if span[0] <= absolute < span[1]), None)
+                if span is not None:
+                    size = min(span[1] - absolute, len(text) - position)
+                    result.append((f"{style} {REFERENCE_STYLES[span[2]]()}".strip(), text[position:position + size], *rest))
+                else:
+                    ahead = [span[0] for span in spans if span[0] > absolute]
+                    size = min([len(text) - position, *(start - absolute for start in ahead)])
+                    result.append((style, text[position:position + size], *rest))
+                position += size
+            offset += len(text)
+        return Transformation(result)
+
+
+def render_user(
+    text: str, state: str = "idle", find: Callable[[str], list[tuple[int, int, str]]] | None = None,
+) -> RenderableType:
+    body = Text("› ")
+    position = 0
+    for start, end, kind in sorted(find(text) if find else []):
+        body.append(text[position:start].replace("\n", "\n  "))
+        body.append(text[start:end], style=REFERENCE_STYLES[kind]())
+        position = end
+    body.append(text[position:].replace("\n", "\n  "))
     if state == "idle":
         return Padding(body, (1, 1), style=t.message)
     labels = {"hover": ("click for options", "dim"), "copied": ("copied ✓", t.success), "failed": ("copy failed", t.danger)}
@@ -203,6 +254,9 @@ def main(argv: list[str] | None = None) -> None:
 
     def system_for(which: str) -> dict:
         return prompts[which]
+
+    def commands() -> dict[str, str]:
+        return dict(COMMANDS)
     workspace = str(Path.cwd().resolve())
     current: Session | None = None
     picking = False
@@ -241,6 +295,7 @@ def main(argv: list[str] | None = None) -> None:
     session_changes: list[Change] = []
     collapsed: list[int] = []
     selected = 0
+    suggestion_top = 0
     folder = str(Path.cwd())
     home = str(Path.home())
     if folder == home or folder.startswith(home + os.sep):
@@ -249,15 +304,44 @@ def main(argv: list[str] | None = None) -> None:
     connection, model = load_selection(connections, DEFAULT_MODEL)
 
     def reset_selection(_) -> None:
-        nonlocal selected, picked
+        nonlocal selected, picked, suggestion_top
         selected = 0
+        suggestion_top = 0
         picked = 0
 
     buffer = Buffer(multiline=True, history=InMemoryHistory(), on_text_changed=reset_selection)
     modal_buffer = Buffer(on_text_changed=reset_selection)
 
-    def suggestions() -> list[str]:
-        return [] if waiting or picking or forming else matching_commands(buffer.text)
+    def mentioning() -> bool:
+        return not picking and not forming and active_mention(buffer.text, buffer.cursor_position) is not None
+
+    def find_references(text: str) -> list[tuple[int, int, str]]:
+        return references(Path(workspace), text, ())
+
+    def suggestions() -> list[Suggestion]:
+        if picking or forming:
+            return []
+        mention = active_mention(buffer.text, buffer.cursor_position)
+        if mention is not None:
+            return [
+                *(Suggestion(path, "", "file") for path in search_paths(workspace_paths(Path(workspace)), mention[1], MENTION_ROWS)),
+            ]
+        if waiting:
+            return []
+        table = commands()
+        return [Suggestion(command, table[command], "command") for command in matching_commands(buffer.text, table)]
+
+    def apply_suggestion(suggestion: Suggestion) -> bool:
+        option = suggestion.text
+        mention = active_mention(buffer.text, buffer.cursor_position)
+        if mention is None:
+            buffer.text = option
+            buffer.cursor_position = len(buffer.text)
+            return False
+        insertion = "@" + option + ("" if option.endswith("/") else " ")
+        buffer.text = buffer.text[:mention[0]] + insertion + buffer.text[buffer.cursor_position:]
+        buffer.cursor_position = mention[0] + len(insertion)
+        return True
 
     def visible_items() -> list[PickerItem]:
         if not picking:
@@ -278,23 +362,66 @@ def main(argv: list[str] | None = None) -> None:
             fragments.extend(row)
         return fragments
 
-    def render_suggestions() -> StyleAndTextTuples:
+    def move_suggestion(step: int) -> None:
+        nonlocal selected
+        count = len(suggestions())
+        if count:
+            selected = max(0, min(selected + step, count - 1))
+
+    def wheel_suggestions(mouse_event: MouseEvent):
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            move_suggestion(-1)
+        elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            move_suggestion(1)
+        else:
+            return NotImplemented
+        get_app().invalidate()
+        return None
+
+    def suggestion_rows() -> list[list[tuple]]:
+        nonlocal suggestion_top
         options = suggestions()
         current_index = min(selected, len(options) - 1)
         width = get_app().output.get_size().columns
-        rows: list[list[tuple[str, str]]] = []
         if not options:
-            rows.append([(t.subtle, f"Enter sends · {NEWLINE_KEY} or Ctrl+J adds a new line")])
-            rows.append([("", " ")])
-        for index, command in enumerate(options):
-            if index == current_index:
-                rows.append([(t.selected, f" {command:<10} {COMMANDS[command]}".ljust(width))])
+            if not mentioning():
+                return []
+            return [[(t.muted, " No matching files")]]
+        overflow = len(options) > SUGGESTION_ROWS
+        suggestion_top = min(max(suggestion_top, current_index - SUGGESTION_ROWS + 1), current_index)
+        suggestion_top = max(0, min(suggestion_top, len(options) - SUGGESTION_ROWS))
+        end = min(len(options), suggestion_top + SUGGESTION_ROWS)
+        body = width - (1 if overflow else 0)
+        thumb_start = suggestion_top * SUGGESTION_ROWS // len(options)
+        thumb_size = max(1, SUGGESTION_ROWS * SUGGESTION_ROWS // len(options))
+        rows: list[list[tuple]] = []
+        for index in range(suggestion_top, end):
+            option = options[index]
+            label = ("@" if option.kind != "command" else "") + option.text
+            if option.kind == "file":
+                row = [(t.selected if index == current_index else t.row_file, f" {label}".ljust(body))]
+            elif index == current_index:
+                row = [(t.selected, f" {label:<12} {option.detail}".ljust(body))]
             else:
-                rows.append([
-                    (t.row_strong, f" {command:<10}"),
-                    (t.row_muted, f" {COMMANDS[command]}".ljust(width - 11)),
-                ])
-        return join_rows(rows)
+                row = [
+                    (t.row_skill if option.kind == "skill" else t.row_strong, f" {label:<12}"),
+                    (t.row_muted, f" {option.detail}".ljust(body - 13)),
+                ]
+            if overflow:
+                position = index - suggestion_top
+                on_thumb = thumb_start <= position < thumb_start + thumb_size
+                row.append((t.muted if on_thumb else t.subtle, "┃" if on_thumb else "│"))
+            rows.append([(style, text, wheel_suggestions) for style, text in row])
+        return rows
+
+    def render_suggestions() -> StyleAndTextTuples:
+        return join_rows(suggestion_rows())
+
+    def render_hint() -> StyleAndTextTuples:
+        return join_rows([
+            [(t.subtle, f"Enter sends · {NEWLINE_KEY} or Ctrl+J adds a new line")],
+            [("", " ")],
+        ])
 
     def modal_width() -> int:
         return max(40, min(get_app().output.get_size().columns - 6, 76))
@@ -369,10 +496,10 @@ def main(argv: list[str] | None = None) -> None:
         ]
 
     def render_menu() -> StyleAndTextTuples:
-        return render_status() if waiting else render_suggestions()
+        return render_status() if waiting else render_hint()
 
     def menu_height() -> int:
-        return 2 if waiting else max(len(suggestions()), 2)
+        return 2
 
     def render_footer() -> StyleAndTextTuples:
         width = get_app().output.get_size().columns
@@ -466,9 +593,11 @@ def main(argv: list[str] | None = None) -> None:
             emit()
             text = event["text"]
             emit(
-                render_user(text), lambda block, event=event: open_task_modal(block, event),
-                lambda state, text=text: render_user(text, state),
+                render_user(text, "idle", find_references), lambda block, event=event: open_task_modal(block, event),
+                lambda state, text=text: render_user(text, state, find_references),
             )
+            if event.get("attached"):
+                emit(Text(" ↳ Attached " + ", ".join(event["attached"]), style="dim"))
             emit()
         elif kind == "changes":
             for item in event["items"]:
@@ -842,7 +971,8 @@ def main(argv: list[str] | None = None) -> None:
 
     def start_turn(message: str) -> None:
         nonlocal waiting, started, answer, tokens, used_tools, task
-        record({"t": "user", "text": message})
+        content, attached = expand_mentions(Path(workspace), message)
+        record({"t": "user", "text": message, "attached": attached})
         waiting = True
         started = time.monotonic()
         answer = ""
@@ -855,7 +985,7 @@ def main(argv: list[str] | None = None) -> None:
         app = get_app()
         task = app.create_background_task(
             run_turn(
-                [system_for(mode), *history[1:], {"role": "user", "content": message}],
+                [system_for(mode), *history[1:], {"role": "user", "content": content}],
                 model, connection, mode == "plan",
             )
         )
@@ -910,7 +1040,7 @@ def main(argv: list[str] | None = None) -> None:
             transcript.jump_to_end()
             return
         if message.startswith("/") and not any(char.isspace() for char in message):
-            emit(Text(f"Unknown command {message}. Commands: {', '.join(COMMANDS)}.", style="dim"))
+            emit(Text(f"Unknown command {message}. Commands: {', '.join(commands())}.", style="dim"))
             emit()
             return
         start_turn(message)
@@ -940,17 +1070,16 @@ def main(argv: list[str] | None = None) -> None:
     @bindings.add("tab", filter=menu_open)
     def complete_suggestion(event: KeyPressEvent) -> None:
         options = suggestions()
-        buffer.text = options[min(selected, len(options) - 1)]
-        buffer.cursor_position = len(buffer.text)
+        apply_suggestion(options[min(selected, len(options) - 1)])
 
     @bindings.add("enter")
     def submit(event: KeyPressEvent) -> None:
+        options = suggestions()
+        if options and apply_suggestion(options[min(selected, len(options) - 1)]):
+            return
+        message = buffer.text.strip()
         if waiting:
             return
-        options = suggestions()
-        if options:
-            buffer.text = options[min(selected, len(options) - 1)]
-        message = buffer.text.strip()
         buffer.reset(append_to_history=True)
         handle(message)
 
@@ -1051,7 +1180,7 @@ def main(argv: list[str] | None = None) -> None:
         transcript.page(-1)
 
     input_window = Window(
-        BufferControl(buffer, input_processors=[PlaceholderProcessor(lambda: "Ask Joy to do something…")]),
+        BufferControl(buffer, input_processors=[ReferenceProcessor(find_references), PlaceholderProcessor(lambda: "Ask Joy to do something…")]),
         height=Dimension(min=1, max=INPUT_MAX_ROWS),
         wrap_lines=True,
         dont_extend_height=True,
@@ -1126,6 +1255,27 @@ def main(argv: list[str] | None = None) -> None:
         Window(height=1, style=lambda: t.surface_bg),
     ])
 
+    def input_rows() -> int:
+        info = input_window.render_info
+        return info.window_height if info is not None else 1
+
+    class OverlayFloat(Float):
+        @property
+        def bottom(self) -> int:
+            return input_rows() + 3
+
+        @bottom.setter
+        def bottom(self, value) -> None:
+            pass
+
+    suggestion_float = OverlayFloat(
+        content=ConditionalContainer(
+            Window(FormattedTextControl(render_suggestions), height=lambda: len(suggestion_rows())),
+            filter=Condition(lambda: bool(suggestion_rows())),
+        ),
+        left=0, right=0,
+    )
+
     root = FloatContainer(
         content=HSplit([
             Window(transcript, always_hide_cursor=True),
@@ -1134,6 +1284,7 @@ def main(argv: list[str] | None = None) -> None:
             Window(FormattedTextControl(render_footer), height=1),
         ]),
         floats=[
+            suggestion_float,
             Float(
                 content=ConditionalContainer(Window(Backdrop(), style="dim"), filter=modal_open),
                 left=0, right=0, top=0, bottom=0, transparent=True,

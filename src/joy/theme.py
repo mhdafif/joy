@@ -1,5 +1,6 @@
-from dataclasses import dataclass
 """Color system: every color in the app comes from the active palette."""
+
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,22 @@ class Palette:
     @property
     def row_muted(self) -> str:
         return f"bg:{self.overlay} {self.muted}"
+
+    @property
+    def skill_ref(self) -> str:
+        return f"bold {self.secondary}"
+
+    @property
+    def file_ref(self) -> str:
+        return f"bold {self.info}"
+
+    @property
+    def row_skill(self) -> str:
+        return f"bg:{self.overlay} bold {self.secondary}"
+
+    @property
+    def row_file(self) -> str:
+        return f"bg:{self.overlay} {self.info}"
 
     @property
     def input_box(self) -> str:

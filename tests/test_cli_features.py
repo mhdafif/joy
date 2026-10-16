@@ -3,11 +3,12 @@ from pathlib import Path
 from unittest.mock import patch
 from prompt_toolkit.formatted_text import to_plain_text
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
-from harness import DOWN, FOOTER, CliCase, Replies, settle, wait_for
+from harness import DOWN, FOOTER, UP, CliCase, Replies, settle, wait_for
 from joy.llm import ToolEvent
 from joy.settings import load_settings
 from joy.sessions import list_sessions
 from joy.theme import active
+from joy.transcript import Transcript
 """Feature behavior of the full-screen app: queue, modes, approvals, undo, compact, and more."""
 
 
@@ -103,6 +104,20 @@ class ModesAndContextTest(CliCase):
 
         self.run_main(driver, Replies())
 
+    def test_tagged_files_are_attached_for_the_model_and_listed_for_you(self):
+        Path("calc.py").write_text("def add(a, b):\n    return a + b\n")
+        replies = Replies()
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "explain @calc.py ")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            self.assertIn("Attached calc.py (2 lines)", transcript.plain())
+
+        self.run_main(driver, replies)
+        sent = replies.user_texts()[0]
+        self.assertIn("explain @calc.py", sent)
+        self.assertIn('<file path="calc.py">\ndef add(a, b):', sent)
+
     def test_new_and_clear_start_fresh_sessions(self):
         replies = Replies()
 
@@ -119,6 +134,64 @@ class ModesAndContextTest(CliCase):
         self.run_main(driver, replies)
         self.assertEqual([m["role"] for m in replies.calls[1]["messages"]], ["system", "user"])
         self.assertEqual(sorted(s.name for s in list_sessions(str(Path.cwd().resolve()))), ["one", "two"])
+
+    def test_opening_the_command_list_does_not_resize_the_conversation(self):
+        replies = Replies()
+
+        async def driver(app, pipe, transcript):
+            window = next(w for w in app.layout.find_all_windows() if isinstance(w.content, Transcript))
+            await settle(0.2)
+            before = window.render_info.window_height
+            pipe.send_text("/")
+            await settle(0.2)
+            self.assertEqual(window.render_info.window_height, before)
+
+        self.run_main(driver, replies)
+
+    def test_the_command_list_shows_five_rows_and_scrolls(self):
+        seen = []
+
+        def listing(app):
+            for window in app.layout.find_all_windows():
+                control = window.content
+                if isinstance(control, FormattedTextControl) and callable(control.text):
+                    text = to_plain_text(control.text())
+                    rows = [line for line in text.splitlines() if line.strip()]
+                    if rows and all(line.startswith(" /") for line in rows):
+                        return rows
+            return []
+
+        async def driver(app, pipe, transcript):
+            pipe.send_text("/")
+            await settle(0.2)
+            top = listing(app)
+            self.assertEqual(len(top), 5)
+            self.assertTrue(top[0].lstrip().startswith("/build"))
+            self.assertIn("┃", "".join(top))
+            for _ in range(7):
+                pipe.send_text(DOWN)
+            await settle(0.2)
+            middle = listing(app)
+            self.assertEqual(len(middle), 5)
+            self.assertNotEqual(middle, top)
+            pipe.send_text(UP)
+            await settle(0.2)
+            self.assertEqual(len(listing(app)), 5)
+            for _ in range(20):
+                pipe.send_text(DOWN)
+            await settle(0.2)
+            bottom = listing(app)
+            self.assertEqual(len(bottom), 5)
+            self.assertIn("/", bottom[-1])
+            pipe.send_text("bu")
+            await settle(0.2)
+            narrowed = listing(app)
+            self.assertEqual(len(narrowed), 1)
+            self.assertNotIn("┃", "".join(narrowed))
+            seen.append(top + middle + bottom)
+
+        self.run_main(driver, Replies())
+        self.assertTrue(seen)
 
 
 class ConnectionsAndSettingsTest(CliCase):
