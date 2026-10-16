@@ -61,6 +61,7 @@ MENTION_ROWS = 8
 SUGGESTION_ROWS = 5
 PLAN_NOTE = "Plan mode: no files changed."
 PLAN_NOTE_REDUNDANT = re.compile(r"read-only|no files (were |have been )?(changed|modified)|nothing (was|has been) changed", re.I)
+QUEUE_LIMIT = 5
 MODEL_ROWS = 14
 CONNECT_STEPS = (
     ("Group name", "for example 9router", False),
@@ -273,6 +274,7 @@ def main(argv: list[str] | None = None) -> None:
     picker_subtitle = ""
     picker_searchable = True
     picker_dismiss: Callable[[], None] | None = None
+    status_label = "Thinking…"
     forming = False
     form_index = 0
     form_values: list[str] = []
@@ -296,6 +298,7 @@ def main(argv: list[str] | None = None) -> None:
     collapsed: list[int] = []
     selected = 0
     suggestion_top = 0
+    queue: list[str] = []
     folder = str(Path.cwd())
     home = str(Path.home())
     if folder == home or folder.startswith(home + os.sep):
@@ -487,19 +490,42 @@ def main(argv: list[str] | None = None) -> None:
         rows.append([(t.group, label), (t.muted, f"  step {form_index + 1} of {len(CONNECT_STEPS)}")])
         return rows
 
+    def remove_queued(index: int, mouse_event=None):
+        if mouse_event is not None and mouse_event.event_type != MouseEventType.MOUSE_UP:
+            return NotImplemented
+        if index < len(queue):
+            del queue[index]
+            get_app().invalidate()
+        return None
+
     def render_status() -> StyleAndTextTuples:
-        return [
+        width = get_app().output.get_size().columns
+        fragments: StyleAndTextTuples = [
             (t.success, "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 10) % 10]),
-            ("", " Thinking…"),
+            ("", f" {status_label}"),
             (t.muted, f"  esc to stop · {format_elapsed(time.monotonic() - started)}"),
-            ("", "\n "),
+            (t.subtle, f"  · enter queues a message ({len(queue)}/{QUEUE_LIMIT})"),
         ]
+        for index, text in enumerate(queue):
+            handler = lambda mouse_event, index=index: remove_queued(index, mouse_event)
+            first = text.split("\n", 1)[0] + (" …" if "\n" in text else "")
+            action = "✕ remove"
+            room = max(width - get_cwidth(action) - 8, 10)
+            while get_cwidth(first) > room:
+                first = first[:-2] + "…"
+            gap = " " * max(1, width - get_cwidth(first) - get_cwidth(action) - 6)
+            fragments += [
+                ("", "\n"), (t.muted, f" {index + 1}. ", handler), (t.text_soft, first, handler),
+                ("", gap, handler), (t.danger, action, handler),
+            ]
+        fragments.append(("", "\n "))
+        return fragments
 
     def render_menu() -> StyleAndTextTuples:
         return render_status() if waiting else render_hint()
 
     def menu_height() -> int:
-        return 2
+        return 2 + len(queue) if waiting else 2
 
     def render_footer() -> StyleAndTextTuples:
         width = get_app().output.get_size().columns
@@ -968,6 +994,12 @@ def main(argv: list[str] | None = None) -> None:
             record({"t": "cancelled"})
         else:
             record({"t": "error", "text": str(failure)})
+        if queue:
+            if outcome == "failed":
+                emit(Text(f"{len(queue)} queued message(s) are waiting. Press Enter on an empty input to run the next one.", style="dim"))
+                emit()
+            else:
+                start_turn(queue.pop(0))
 
     def start_turn(message: str) -> None:
         nonlocal waiting, started, answer, tokens, used_tools, task
@@ -1079,9 +1111,30 @@ def main(argv: list[str] | None = None) -> None:
             return
         message = buffer.text.strip()
         if waiting:
+            if not message:
+                return
+            if message.startswith("/") and not any(char.isspace() for char in message):
+                emit(Text("Commands can run once the reply has finished.", style="dim"))
+                emit()
+                return
+            if len(queue) >= QUEUE_LIMIT:
+                emit(Text(f"The queue is full ({QUEUE_LIMIT}). Remove one or wait for the reply.", style="dim"))
+                emit()
+                return
+            buffer.reset(append_to_history=True)
+            queue.append(message)
+            get_app().invalidate()
+            return
+        if not message and queue:
+            start_turn(queue.pop(0))
             return
         buffer.reset(append_to_history=True)
         handle(message)
+
+    @bindings.add("up", filter=Condition(lambda: bool(queue) and not buffer.text) & ~modal_open)
+    def recall_queued(event: KeyPressEvent) -> None:
+        buffer.text = queue.pop()
+        buffer.cursor_position = len(buffer.text)
 
     @bindings.add("c-c")
     def clear_input(event: KeyPressEvent) -> None:

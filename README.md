@@ -67,6 +67,7 @@ Without the script, set these in your shell; `.env` files are not loaded automat
 
 Joy opens on its own full-screen page, like vim or OpenCode, and your terminal is restored when you exit. The conversation, diffs, and input all live on that page.
 
+- **Enter** — send a message. While Joy is still working, Enter adds your message to a queue of up to 5, listed above the input, and each one is sent automatically when the previous reply finishes. Click a queued message to remove it, or press Up on an empty input to pull the newest one back into the input to edit. Stopping a reply with Esc moves on to the next queued message; if a reply fails, the queue waits and Enter on an empty input runs the next one. Commands (`/…`) cannot be queued.
 - **Tab** — switch between **Build** and **Plan** mode (also `/build` and `/plan`); the current mode is shown on the input box. In **Plan** mode Joy only investigates: it can use `read` and a read-only `bash`, and answers with a plan instead of changing anything. If you ask it to actually change something ("create a file", "fix the bug"), it says in one short sentence that Plan mode is read-only and to press Tab for Build, instead of drafting a plan. When a Plan answer comes after Joy looked at your files or ran a command, it ends with an italic *Plan mode: no files changed.* line (unless the answer already says so); a plain chat answer such as "hi" does not. Switch back to Build and ask it to go ahead when you are happy with the plan; "apply the plan" applies the latest plan in the conversation.
 - **Click a message you sent** — opens a small window with **Copy message**. The message lightens and shows `click for options` while the pointer is over it.
 - **Page Up / Page Down** or the **mouse wheel** — scroll the conversation. New output keeps the view where it is while you read earlier messages; sending a message jumps back to the bottom.
@@ -102,8 +103,7 @@ Connections and the selected model are stored in `~/.joy/settings.json`, includi
 
 Every conversation is saved automatically to `~/.joy/sessions` (set `JOY_HOME` to change it) and belongs to the folder you launched Joy from. Start Joy with `joy --continue` (or `joy -c`) to pick up the last session in the current folder, including earlier messages, diffs, and what the model remembers. Use `/session` inside Joy to switch to an older one. Session files contain your conversation and file diffs, so treat them like your shell history.
 
-You can draft your next message while a reply streams. Conversation history lasts
-until you exit. Cancelling stops further tool calls; completed file changes remain.
+Cancelling stops further tool calls; completed file changes remain.
 The API request may still finish in the background.
 
 While any window is open, the screen behind it is dimmed.

@@ -1,9 +1,10 @@
+import asyncio
 import re
 from pathlib import Path
 from unittest.mock import patch
 from prompt_toolkit.formatted_text import to_plain_text
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
-from harness import DOWN, FOOTER, UP, CliCase, Replies, settle, wait_for
+from harness import DOWN, ESCAPE, FOOTER, UP, CliCase, Replies, settle, wait_for
 from joy.llm import ToolEvent
 from joy.settings import load_settings
 from joy.sessions import list_sessions
@@ -15,6 +16,109 @@ from joy.transcript import Transcript
 async def say(pipe, text):
     pipe.send_text(text + "\r")
     await settle(0.05)
+
+
+class QueueTest(CliCase):
+    def blocked_first_reply(self):
+        gates = []
+
+        async def first(call):
+            gates.append(asyncio.Event())
+            await gates[0].wait()
+            yield "first done"
+
+        return Replies(first), gates
+
+    def test_messages_sent_while_working_run_in_order_and_five_is_the_limit(self):
+        replies, gates = self.blocked_first_reply()
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "one")
+            await wait_for(lambda: len(replies.calls) == 1)
+            for text in "abcde":
+                await say(pipe, text)
+            await say(pipe, "f")
+            await wait_for(lambda: "The queue is full (5)" in transcript.plain())
+            self.assertEqual(app.current_buffer.text, "f")
+            gates[0].set()
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 6)
+
+        self.run_main(driver, replies)
+        self.assertEqual(replies.user_texts(), ["one", "a", "b", "c", "d", "e"])
+
+    def test_up_pulls_the_newest_queued_message_back_into_the_input(self):
+        replies, gates = self.blocked_first_reply()
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "one")
+            await wait_for(lambda: len(replies.calls) == 1)
+            await say(pipe, "a")
+            await say(pipe, "b")
+            pipe.send_text(UP)
+            await wait_for(lambda: app.current_buffer.text == "b")
+            gates[0].set()
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 2)
+
+        self.run_main(driver, replies)
+        self.assertEqual(replies.user_texts(), ["one", "a"])
+
+    def test_commands_cannot_be_queued(self):
+        replies, gates = self.blocked_first_reply()
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "one")
+            await wait_for(lambda: len(replies.calls) == 1)
+            await say(pipe, "/model")
+            await wait_for(lambda: "Commands can run once the reply has finished." in transcript.plain())
+            gates[0].set()
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            await settle(0.2)
+
+        self.run_main(driver, replies)
+        self.assertEqual(len(replies.calls), 1)
+
+    def test_a_failed_reply_holds_the_queue_until_enter_is_pressed(self):
+        gates = []
+
+        async def failing(call):
+            gates.append(asyncio.Event())
+            await gates[0].wait()
+            raise RuntimeError("boom")
+            yield
+
+        replies = Replies(failing)
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "one")
+            await wait_for(lambda: len(replies.calls) == 1)
+            await say(pipe, "a")
+            gates[0].set()
+            await wait_for(lambda: "queued message(s) are waiting" in transcript.plain())
+            await settle(0.2)
+            self.assertEqual(len(replies.calls), 1)
+            await say(pipe, "")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+
+        self.run_main(driver, replies)
+        self.assertEqual(replies.user_texts(), ["one", "a"])
+
+    def test_escape_stops_the_reply_and_the_next_queued_message_starts(self):
+        async def forever(call):
+            await asyncio.sleep(30)
+            yield "never"
+
+        replies = Replies(forever)
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "one")
+            await wait_for(lambda: len(replies.calls) == 1)
+            await say(pipe, "a")
+            pipe.send_text(ESCAPE)
+            await wait_for(lambda: "Response cancelled." in transcript.plain())
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+
+        self.run_main(driver, replies)
+        self.assertEqual(replies.user_texts(), ["one", "a"])
 
 
 class ModesAndContextTest(CliCase):
