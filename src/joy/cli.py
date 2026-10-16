@@ -20,10 +20,11 @@ from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
+from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from prompt_toolkit.layout import (
     ConditionalContainer, Dimension, Float, FloatContainer, HSplit, Layout, VSplit, Window,
 )
-from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl, UIContent, UIControl
 from prompt_toolkit.layout.processors import (
     ConditionalProcessor, PasswordProcessor, Processor, Transformation, TransformationInput,
 )
@@ -217,6 +218,7 @@ def main(argv: list[str] | None = None) -> None:
     picker_id = 0
     picker_subtitle = ""
     picker_searchable = True
+    picker_dismiss: Callable[[], None] | None = None
     forming = False
     form_index = 0
     form_values: list[str] = []
@@ -557,11 +559,12 @@ def main(argv: list[str] | None = None) -> None:
         notes: dict[str, str] | None = None, custom: Callable[[str], PickerItem] | None = None,
         limit: int = PICKER_ROWS, order: list[str] | None = None,
         hint: list[tuple[str, str]] | None = None, subtitle: str = "", searchable: bool = True,
+        dismiss: Callable[[], None] | None = None,
     ) -> int:
         nonlocal picking, picked, picker_title, picker_items, picker_notes, picker_choose
         nonlocal picker_custom, picker_id, picker_limit, picker_order, picker_hint
-        nonlocal picker_subtitle, picker_searchable
-        picker_subtitle, picker_searchable = subtitle, searchable
+        nonlocal picker_subtitle, picker_searchable, picker_dismiss
+        picker_subtitle, picker_searchable, picker_dismiss = subtitle, searchable, dismiss
         picking = True
         picked = 0
         picker_title, picker_items, picker_notes = title, items, dict(notes or {})
@@ -580,9 +583,11 @@ def main(argv: list[str] | None = None) -> None:
         get_app().layout.focus(input_window)
 
     def choose_item() -> None:
+        nonlocal picker_dismiss
         items = visible_items()
         chosen = items[min(picked, len(items) - 1)] if items else None
         choose = picker_choose
+        picker_dismiss = None
         close_picker()
         if chosen is not None and choose is not None:
             choose(chosen)
@@ -996,10 +1001,17 @@ def main(argv: list[str] | None = None) -> None:
     def select_item(event: KeyPressEvent) -> None:
         choose_item()
 
+    def dismiss_picker() -> None:
+        nonlocal picker_dismiss
+        callback, picker_dismiss = picker_dismiss, None
+        close_picker()
+        if callback is not None:
+            callback()
+
     @bindings.add("escape", filter=picking_open)
     @bindings.add("c-c", filter=picking_open)
-    def dismiss_picker(event: KeyPressEvent) -> None:
-        close_picker()
+    def dismiss_picker_key(event: KeyPressEvent) -> None:
+        dismiss_picker()
 
     @bindings.add("enter", filter=forming_open)
     def next_step(event: KeyPressEvent) -> None:
@@ -1009,6 +1021,26 @@ def main(argv: list[str] | None = None) -> None:
     @bindings.add("c-c", filter=forming_open)
     def dismiss_form(event: KeyPressEvent) -> None:
         cancel_connect()
+
+    def dismiss_modal() -> None:
+        if picking:
+            dismiss_picker()
+        elif forming:
+            cancel_connect()
+        get_app().invalidate()
+
+    class Backdrop(UIControl):
+        def create_content(self, width: int, height: int) -> UIContent:
+            return UIContent(get_line=lambda index: [], line_count=1, show_cursor=False)
+
+        def is_focusable(self) -> bool:
+            return False
+
+        def mouse_handler(self, mouse_event: MouseEvent):
+            if mouse_event.event_type != MouseEventType.MOUSE_UP:
+                return NotImplemented
+            dismiss_modal()
+            return None
 
     @bindings.add("pageup")
     def scroll_up(event: KeyPressEvent) -> None:
@@ -1103,7 +1135,7 @@ def main(argv: list[str] | None = None) -> None:
         ]),
         floats=[
             Float(
-                content=ConditionalContainer(Window(style="dim"), filter=modal_open),
+                content=ConditionalContainer(Window(Backdrop(), style="dim"), filter=modal_open),
                 left=0, right=0, top=0, bottom=0, transparent=True,
             ),
             modal_float(picker_modal, picking_open),

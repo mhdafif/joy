@@ -1,6 +1,8 @@
 import re
 from pathlib import Path
 from unittest.mock import patch
+from prompt_toolkit.formatted_text import to_plain_text
+from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from harness import DOWN, FOOTER, CliCase, Replies, settle, wait_for
 from joy.llm import ToolEvent
 from joy.settings import load_settings
@@ -72,6 +74,34 @@ class ModesAndContextTest(CliCase):
         self.assertIn("read-only", system)
         self.assertIn("Press Tab to switch to Build", system)
         self.assertIn("never say that yourself", system)
+
+    def test_clicking_outside_any_modal_closes_it(self):
+        def screen(app):
+            parts = []
+            for window in app.layout.find_all_windows():
+                control = window.content
+                if isinstance(control, FormattedTextControl) and callable(control.text):
+                    parts.append(to_plain_text(control.text()))
+            return "\n".join(parts)
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "/theme")
+            await settle(0.25)
+            self.assertIn("Cetak Biru", screen(app))
+            pipe.send_text("\x1b[<0;1;1m")
+            await settle(0.25)
+            self.assertNotIn("Cetak Biru", screen(app))
+            await say(pipe, "/connect")
+            await settle(0.25)
+            main_input = next(w for w in app.layout.find_all_windows() if isinstance(w.content, BufferControl) and w.content.buffer.multiline())
+            self.assertIsNot(app.layout.current_window, main_input)
+            pipe.send_text("\x1b[<0;1;1m")
+            await settle(0.25)
+            self.assertIs(app.layout.current_window, main_input)
+            pipe.send_text("typed")
+            await wait_for(lambda: app.current_buffer.text == "typed")
+
+        self.run_main(driver, Replies())
 
     def test_new_and_clear_start_fresh_sessions(self):
         replies = Replies()
