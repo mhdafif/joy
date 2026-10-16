@@ -823,8 +823,9 @@ def main(argv: list[str] | None = None) -> None:
         get_app().invalidate()
 
     def start_new_session() -> None:
-        nonlocal current, history, context_tokens
+        nonlocal current, history, context_tokens, approve_all
         current = None
+        approve_all = False
         history = [system_for(mode)]
         context_tokens = 0
         reset_view()
@@ -869,7 +870,9 @@ def main(argv: list[str] | None = None) -> None:
             choose(chosen)
 
     def pick_session(item: PickerItem) -> None:
+        nonlocal approve_all
         if current is None or item.value.id != current.id:
+            approve_all = False
             load_session(item.value)
 
     def open_session_picker() -> None:

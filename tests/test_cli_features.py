@@ -530,6 +530,42 @@ class ApprovalTest(CliCase):
             ("touch c", False), ("touch d", True), ("touch e", True),
         ])
 
+    def test_allow_all_ends_with_the_session(self):
+        outcomes = []
+
+        def turn(command):
+            async def behave(call):
+                decision = Decision()
+                yield Approval("bash", command, decision)
+                while not decision.event.is_set():
+                    await asyncio.sleep(0.01)
+                outcomes.append((command, decision.allowed))
+                yield "ok"
+            return behave
+
+        replies = Replies(turn("touch a"), turn("touch b"), turn("touch c"))
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "go")
+            await wait_for(lambda: len(replies.calls) == 1)
+            await settle(0.25)
+            pipe.send_text(DOWN + DOWN + "\r")
+            await wait_for(lambda: len(outcomes) == 1)
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            await say(pipe, "go")
+            await wait_for(lambda: len(outcomes) == 2)
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 2)
+            await say(pipe, "/new")
+            await settle(0.2)
+            await say(pipe, "go")
+            await wait_for(lambda: len(replies.calls) == 3)
+            await settle(0.25)
+            pipe.send_text(ESCAPE)
+            await wait_for(lambda: len(outcomes) == 3)
+
+        self.run_main(driver, replies)
+        self.assertEqual(outcomes, [("touch a", True), ("touch b", True), ("touch c", False)])
+
     def test_the_approval_prompt_floats_above_the_input_and_takes_keys_and_clicks(self):
         outcomes = []
 
