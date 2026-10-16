@@ -376,6 +376,25 @@ class ModesAndContextTest(CliCase):
         self.run_main(driver, replies)
         self.assertEqual(replies.calls, [])
 
+    def test_export_writes_markdown_to_a_chosen_file_or_the_default_folder(self):
+        replies = Replies()
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "/export")
+            await wait_for(lambda: "nothing to export" in transcript.plain())
+            await say(pipe, "hello there")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            await say(pipe, "/export notes.md")
+            await wait_for(lambda: "Saved this session to" in transcript.plain())
+            await say(pipe, "/export")
+            await wait_for(lambda: transcript.plain().count("Saved this session to") == 2)
+
+        self.run_main(driver, replies)
+        text = Path("notes.md").read_text()
+        for expected in ["# hello there", "## You", "## Joy", "Reply to hello there."]:
+            self.assertIn(expected, text)
+        self.assertEqual(len(list((Path(self.home.name) / "exports").glob("hello-there-*.md"))), 1)
+
     def test_opening_the_command_list_does_not_resize_the_conversation(self):
         replies = Replies()
 

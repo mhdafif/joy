@@ -42,6 +42,7 @@ from joy.connections import (
     RECENT_LIMIT, Connection, load_connections, load_recent, load_selection, save_connection, save_selection,
 )
 from joy.clipboard import copy_text, osc52
+from joy.export import to_markdown
 from joy.instructions import load_instructions
 from joy.diffview import COLLAPSED_LINES, merge_changes, render_change
 from joy.mentions import (
@@ -49,7 +50,7 @@ from joy.mentions import (
 )
 from joy.markdown import JoyMarkdown
 from joy.llm import DEFAULT_MODEL, Approval, ToolEvent, Usage, list_models, stream_reply
-from joy.settings import load_settings, save_settings
+from joy.settings import joy_home, load_settings, save_settings
 from joy.skills import discover as discover_skills
 from joy.theme import PALETTES, active, t, use
 from joy.sessions import Session, delete_session, latest_session, list_sessions, new_session, save_session
@@ -95,6 +96,7 @@ COMPACT_REQUEST = (
 COMMANDS = dict(sorted({
     "/expand": "show a full diff",
     "/compact": "summarize the conversation to free up context",
+    "/export": "save this session as a Markdown file",
     "/undo": "undo a task: revert its file changes and rewind the chat",
     "/build": "build mode: Joy can change files",
     "/plan": "plan mode: Joy only investigates and proposes a plan",
@@ -1309,6 +1311,24 @@ def main(argv: list[str] | None = None) -> None:
         task = app.create_background_task(run_compact())
         app.create_background_task(tick())
 
+    def export_session(argument: str) -> None:
+        if current is None or not current.events:
+            emit(Text("There is nothing to export yet.", style="dim"))
+            emit()
+            return
+        slug = re.sub(r"[^a-z0-9]+", "-", current.name.lower()).strip("-")[:40] or "session"
+        target = Path(argument).expanduser() if argument else joy_home() / "exports" / f"{slug}-{time.strftime('%Y%m%d-%H%M')}.md"
+        if not target.is_absolute():
+            target = Path(workspace) / target
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(to_markdown(current), encoding="utf-8")
+        except OSError as error:
+            emit(Text(f"Could not save the export: {error}", style=t.danger))
+        else:
+            emit(Text(f"Saved this session to {target}", style="dim"))
+        emit()
+
     def set_mode(new_mode: str) -> None:
         nonlocal mode
         if new_mode == mode:
@@ -1370,6 +1390,8 @@ def main(argv: list[str] | None = None) -> None:
         if command == "/expand":
             expand(argument.strip())
             transcript.jump_to_end()
+        if command == "/export":
+            export_session(argument.strip())
             return
         if message.startswith("/") and not any(char.isspace() for char in message):
             emit(Text(f"Unknown command {message}. Commands: {', '.join(commands())}.", style="dim"))

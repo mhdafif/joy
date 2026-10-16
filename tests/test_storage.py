@@ -8,6 +8,7 @@ from joy import sessions
 from joy.connections import (
     DEFAULT_NAME, Connection, load_connections, load_recent, load_selection, save_connection, save_selection,
 )
+from joy.export import to_markdown
 from joy.settings import load_settings, save_settings
 from joy.undo import revert_change
 """Sessions, settings, connections, undo, and export, against a temporary home folder."""
@@ -118,3 +119,23 @@ class UndoTest(unittest.TestCase):
         item = {'path': str(outside), 'kind': 'created', 'before': '', 'after': 'keep\n'}
         self.assertFalse(revert_change(self.root, item))
         self.assertTrue(outside.exists())
+
+
+class ExportTest(HomeCase):
+    def test_markdown_has_messages_steps_diffs_and_footer(self):
+        session = sessions.new_session('/work', 'make a file')
+        session.events = [
+            {'t': 'user', 'text': 'make a file', 'attached': ['a.py (2 lines)']},
+            {'t': 'tool', 'name': 'write', 'detail': 'n.txt', 'status': 'finished'},
+            {'t': 'tool', 'name': 'bash', 'detail': 'false', 'status': 'failed'},
+            {'t': 'changes', 'items': [{'path': 'n.txt', 'kind': 'created', 'before': '', 'after': 'v1\n'}]},
+            {'t': 'text', 'text': 'Done.'},
+            {'t': 'footer', 'model': 'm', 'elapsed': 3.2, 'tokens': 1200},
+            {'t': 'compact', 'summary': 'SUMMARY', 'before': 10, 'after': 1},
+            {'t': 'error', 'text': 'boom'},
+        ]
+        text = to_markdown(session)
+        for expected in ['# make a file', '## You', 'make a file', '_Attached: a.py (2 lines)_', '- `write` n.txt',
+                         '- ✗ `bash` false', '**Created `n.txt`**', '+v1', '## Joy', 'Done.', '_m | 3s | 1200 tokens_',
+                         'SUMMARY', '> boom']:
+            self.assertIn(expected, text)
