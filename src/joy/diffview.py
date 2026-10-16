@@ -227,7 +227,7 @@ def render_change(change: Change, number: int, limit: int | None = COLLAPSED_LIN
     hidden = len(rows) - len(shown)
     subtitle = Text(f"… {hidden} more lines · /expand {number}", style="dim") if hidden else None
     if not rows:
-        message = "(no changes)" if change.before == change.after else "(line endings changed)"
+        message = "(empty file)" if change.kind == "created" and not change.after else "(no changes)" if change.before == change.after else "(line endings changed)"
         body: Table | Text = Text(message, style="dim")
     else:
         old_text = _highlight(change.path, change.before) if change.kind != "created" else None

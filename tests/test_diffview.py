@@ -60,6 +60,7 @@ class DiffTest(unittest.TestCase):
         self.assertIn('35 more lines', text)
 
     def test_empty_and_unchanged_messages(self):
+        self.assertIn('(empty file)', render_text(Change('e.txt', 'created', '', ''))[0])
         self.assertIn('(no changes)', render_text(Change('e.txt', 'modified', 'a\n', 'a\n'))[0])
         self.assertIn('(line endings changed)', render_text(Change('e.txt', 'modified', 'a\r\nb\r\n', 'a\nb\n'))[0])
 
