@@ -106,6 +106,10 @@ Every conversation is saved automatically to `~/.joy/sessions` (set `JOY_HOME` t
 Cancelling stops further tool calls; completed file changes remain.
 The API request may still finish in the background.
 
+### Project instructions and skills
+
+If the folder (or a parent up to the git root) has an `AGENTS.md` or `CLAUDE.md`, Joy adds it to its instructions; `~/.joy/AGENTS.md` applies everywhere. A **skill** is a folder with a `SKILL.md` (with `name` and `description` in its header) in `.joy/skills/` or `.claude/skills/` in the project, or in `~/.joy/skills/`. Joy lists the skills it finds, loads one on demand with a `skill` tool when a task matches, and you can call one yourself by tagging it with `@`, for example `@atomic-commit commit my changes`. Tagged skills and files are colored differently (skills in the theme's secondary color, files in its info color) in the suggestion list, in the input once they match a real skill or path, and in the message you sent. Typing `@` lists matching skills (with their descriptions) above the files, and `/skills` opens a window with all of them (Enter puts `@name` in the input). The welcome page shows how many were loaded; click the `Skills: n` text to open the same window.
+
 While any window is open, the screen behind it is dimmed.
 
 File tools operate inside the directory where you launch Joy. Bash runs with your

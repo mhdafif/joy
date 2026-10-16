@@ -41,7 +41,7 @@ def _describe(arguments: str) -> str:
         return ""
     if not isinstance(values, dict):
         return ""
-    text = " ".join(str(values.get("command") or values.get("path") or "").split())
+    text = " ".join(str(values.get("command") or values.get("path") or values.get("name") or "").split())
     return text if len(text) <= DETAIL_LIMIT else text[:DETAIL_LIMIT - 1] + "…"
 
 
@@ -92,7 +92,7 @@ def list_models(connection: Connection | None = None) -> list[str]:
 
 async def stream_reply(
     messages: list[dict], model: str | None = None, connection: Connection | None = None,
-    readonly: bool = False,
+    readonly: bool = False, skills: dict | None = None,
 ) -> AsyncIterator[str | ToolEvent | Change | Usage]:
     model = model or DEFAULT_MODEL
     result: Queue[str | ToolEvent | Change | Usage | Exception | None] = Queue()
@@ -103,7 +103,7 @@ async def stream_reply(
         client = None
         try:
             client = OpenAI(timeout=60.0, max_retries=0, **(connection.client_options() if connection else {}))
-            toolbox = create_tools(workspace, cancelled, result.put, readonly)
+            toolbox = create_tools(workspace, cancelled, result.put, readonly, skills=skills)
             conversation = list(messages)
             for _ in range(16):
                 if cancelled.is_set():

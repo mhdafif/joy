@@ -6,7 +6,7 @@ from rich.text import Text
 
 from joy.theme import t
 
-TOOL_GLYPHS = {"read": ("→", "Read"), "write": ("←", "Write"), "edit": ("←", "Edit"), "bash": ("$", "")}
+TOOL_GLYPHS = {"read": ("→", "Read"), "write": ("←", "Write"), "edit": ("←", "Edit"), "bash": ("$", ""), "skill": ("✦", "Skill")}
 VERBS = {"read": "read", "write": "wrote", "edit": "edited"}
 
 
@@ -36,6 +36,9 @@ def summarize(steps: list[dict]) -> str:
     commands = sum(1 for step in steps if step["name"] == "bash")
     if commands:
         phrases.append("ran " + _plural(commands, "command"))
+    loaded = list(dict.fromkeys(step.get("detail") or "a" for step in steps if step["name"] == "skill"))
+    if loaded:
+        phrases.append(f"loaded the {loaded[0]} skill" if len(loaded) == 1 else f"loaded {len(loaded)} skills")
     others = sum(1 for step in steps if step["name"] not in TOOL_GLYPHS)
     if others:
         phrases.append("used " + _plural(others, "other tool"))

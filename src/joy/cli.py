@@ -42,13 +42,15 @@ from joy.connections import (
     RECENT_LIMIT, Connection, load_connections, load_recent, load_selection, save_connection, save_selection,
 )
 from joy.clipboard import copy_text, osc52
+from joy.instructions import load_instructions
 from joy.diffview import COLLAPSED_LINES, merge_changes, render_change
 from joy.mentions import (
-    active_mention, expand as expand_mentions, references, search as search_paths, workspace_paths,
+    active_mention, expand as expand_mentions, mentioned_skills, references, search as search_paths, workspace_paths,
 )
 from joy.markdown import JoyMarkdown
 from joy.llm import DEFAULT_MODEL, ToolEvent, Usage, list_models, stream_reply
 from joy.settings import load_settings, save_settings
+from joy.skills import discover as discover_skills
 from joy.theme import PALETTES, active, t, use
 from joy.sessions import Session, latest_session, list_sessions, new_session, save_session
 from joy.steps import StepGroup
@@ -83,6 +85,7 @@ COMMANDS = dict(sorted({
     "/build": "build mode: Joy can change files",
     "/plan": "plan mode: Joy only investigates and proposes a plan",
     "/session": "switch to another session",
+    "/skills": "list the available skills",
     "/theme": "choose the color theme",
     "/new": "start a new session",
     "/clear": "start a new session",
@@ -262,7 +265,15 @@ def main(argv: list[str] | None = None) -> None:
     history = [prompts[mode]]
 
     def system_for(which: str) -> dict:
-        return prompts[which]
+        text, _ = load_instructions(Path(workspace))
+        extra = ""
+        if text:
+            extra += "\n\nProject instructions (written by the user for this repository; follow them):\n" + text
+        if skills:
+            extra += "\n\nSkills you can load with the skill tool when a task matches:\n" + "\n".join(
+                f"- {skill.name}: {skill.description}" for skill in skills.values()
+            )
+        return {"role": "system", "content": prompts[which]["content"] + extra}
 
     def commands() -> dict[str, str]:
         return dict(COMMANDS)
@@ -283,6 +294,8 @@ def main(argv: list[str] | None = None) -> None:
     picker_searchable = True
     picker_dismiss: Callable[[], None] | None = None
     status_label = "Thinking…"
+    skills = discover_skills(Path(workspace))
+    instruction_files = load_instructions(Path(workspace))[1]
     forming = False
     form_index = 0
     form_values: list[str] = []
@@ -327,14 +340,16 @@ def main(argv: list[str] | None = None) -> None:
         return not picking and not forming and active_mention(buffer.text, buffer.cursor_position) is not None
 
     def find_references(text: str) -> list[tuple[int, int, str]]:
-        return references(Path(workspace), text, ())
+        return references(Path(workspace), text, skills)
 
     def suggestions() -> list[Suggestion]:
         if picking or forming:
             return []
         mention = active_mention(buffer.text, buffer.cursor_position)
         if mention is not None:
+            names = search_paths(sorted(skills), mention[1], MENTION_ROWS)
             return [
+                *(Suggestion(name, skills[name].description, "skill") for name in names),
                 *(Suggestion(path, "", "file") for path in search_paths(workspace_paths(Path(workspace)), mention[1], MENTION_ROWS)),
             ]
         if waiting:
@@ -397,7 +412,7 @@ def main(argv: list[str] | None = None) -> None:
         if not options:
             if not mentioning():
                 return []
-            return [[(t.muted, " No matching files")]]
+            return [[(t.muted, " No matching files or skills" if skills else " No matching files")]]
         overflow = len(options) > SUGGESTION_ROWS
         suggestion_top = min(max(suggestion_top, current_index - SUGGESTION_ROWS + 1), current_index)
         suggestion_top = max(0, min(suggestion_top, len(options) - SUGGESTION_ROWS))
@@ -549,8 +564,9 @@ def main(argv: list[str] | None = None) -> None:
     def emit(
         renderable: RenderableType | None = None, on_click: Callable[[Block], None] | None = None,
         renderer: Callable[[str], RenderableType] | None = None,
+        hit: Callable[[Block, int, int], bool] | None = None,
     ) -> Block:
-        block = transcript.add(Text("") if renderable is None else renderable, on_click, renderer)
+        block = transcript.add(Text("") if renderable is None else renderable, on_click, renderer, hit)
         get_app().invalidate()
         return block
 
@@ -686,7 +702,8 @@ def main(argv: list[str] | None = None) -> None:
         tips.add_column(style=t.muted)
         for key, description in (
             ("Tab", "switch between Build and Plan mode"),
-            ("@", "tag a file or folder in your message"),
+            ("@", "tag a file, folder, or skill in your message"),
+            ("/skills", "list the available skills"),
             ("/model", "choose the model"),
             ("/connect", "add another endpoint"),
             ("/theme", "change the colors"),
@@ -700,6 +717,20 @@ def main(argv: list[str] | None = None) -> None:
             Padding(Text("Joy — a terminal coding agent", style=t.muted), (0, 0, 1, 2)),
             Padding(tips, (0, 0, 1, 2)),
         ))
+        if instruction_files:
+            names = ", ".join(path.name for path in instruction_files)
+            transcript.add(Padding(Text("Instructions: " + names, style=t.subtle), (0, 0, 0 if skills else 1, 2)))
+        if skills:
+            def skills_text(state: str) -> str:
+                return f"Skills: {len(skills)}" + (" (click to view)" if state == "hover" else "")
+
+            def render_skills(state: str) -> RenderableType:
+                return Padding(Text(skills_text(state), style=t.text_dim if state == "hover" else t.subtle), (0, 0, 1, 2))
+
+            transcript.add(
+                render_skills("idle"), lambda block: open_skills(), render_skills,
+                lambda block, row, column: row == 0 and 2 <= column < 2 + len(skills_text(block.state)),
+            )
 
     def reset_view() -> None:
         nonlocal last_kind, last_group
@@ -793,6 +824,28 @@ def main(argv: list[str] | None = None) -> None:
             "Task", [PickerItem("Copy message", "", "copy")],
             lambda item: run_task_action(str(item.value), block, event), searchable=False, subtitle=event["text"],
             hint=[(t.strong, "Enter"), (t.muted, " to choose · Esc closes")],
+        )
+
+    def use_skill(item: PickerItem) -> None:
+        buffer.text = f"@{item.value} "
+        buffer.cursor_position = len(buffer.text)
+
+    def open_skills() -> None:
+        if picking or forming:
+            return
+        if not skills:
+            emit(Text("No skills found. Add a folder with a SKILL.md to .claude/skills, .joy/skills, or ~/.joy/skills.", style="dim"))
+            emit()
+            return
+        room = max(20, modal_width() // 2)
+        open_picker(
+            "Skills",
+            [
+                PickerItem(skill.name, skill.description if len(skill.description) <= room else skill.description[:room - 1] + "…", skill.name)
+                for skill in sorted(skills.values(), key=lambda skill: skill.name)
+            ],
+            use_skill, subtitle=f"{len(skills)} available",
+            hint=[(t.strong, "Enter"), (t.muted, " to use with @ · type to search · Esc closes")],
         )
 
     def set_theme(item: PickerItem) -> None:
@@ -968,7 +1021,7 @@ def main(argv: list[str] | None = None) -> None:
         outcome = "done"
         failure: Exception | None = None
         try:
-            async with aclosing(stream_reply(messages, used_model, used_connection, readonly)) as stream:
+            async with aclosing(stream_reply(messages, used_model, used_connection, readonly, skills or None)) as stream:
                 async for chunk in stream:
                     if isinstance(chunk, ToolEvent):
                         used_tools = True
@@ -1021,10 +1074,16 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 start_turn(queue.pop(0))
 
-    def start_turn(message: str) -> None:
-        nonlocal waiting, started, answer, tokens, used_tools, task
-        content, attached = expand_mentions(Path(workspace), message)
-        record({"t": "user", "text": message, "attached": attached})
+    def start_turn(message: str, display: str | None = None) -> None:
+        nonlocal waiting, started, answer, tokens, used_tools, task, skills
+        skills = discover_skills(Path(workspace))
+        used = mentioned_skills(message, skills)
+        sent = message
+        if used:
+            names = ", ".join(f'"{name}"' for name in used)
+            sent = f"Use the {names} skill{'s' if len(used) > 1 else ''} for this request (load with the skill tool first).\n\n{message}"
+        content, attached = expand_mentions(Path(workspace), sent)
+        record({"t": "user", "text": display or message, "attached": attached})
         waiting = True
         started = time.monotonic()
         answer = ""
@@ -1079,6 +1138,9 @@ def main(argv: list[str] | None = None) -> None:
             return
         if message == "/theme":
             open_theme_picker()
+            return
+        if message == "/skills":
+            open_skills()
             return
         if message == "/model":
             open_model_picker()

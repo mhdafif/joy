@@ -4,7 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 from prompt_toolkit.formatted_text import to_plain_text
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
-from harness import DOWN, ESCAPE, FOOTER, UP, CliCase, Replies, settle, wait_for
+from harness import DOWN, ESCAPE, FOOTER, UP, CliCase, Replies, last_user_text, settle, wait_for
 from joy.llm import ToolEvent
 from joy.settings import load_settings
 from joy.sessions import list_sessions
@@ -179,6 +179,106 @@ class ModesAndContextTest(CliCase):
         self.assertIn("read-only", system)
         self.assertIn("Press Tab to switch to Build", system)
         self.assertIn("never say that yourself", system)
+
+    def test_welcome_page_instructions_and_skill_commands(self):
+        Path("AGENTS.md").write_text("Always answer in haiku.\n")
+        skill = Path(".claude/skills/demo")
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: demo\ndescription: Demo skill that says hello\n---\nSay hello.\n")
+        replies = Replies()
+
+        async def driver(app, pipe, transcript):
+            text = transcript.plain()
+            for expected in ["Joy — a terminal coding agent", "Tab", "Instructions: AGENTS.md", "Skills: 1"]:
+                self.assertIn(expected, text)
+            await say(pipe, "@demo please")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            self.assertIn("› @demo please", transcript.plain())
+
+        self.run_main(driver, replies)
+        call = replies.calls[0]
+        self.assertIn("Always answer in haiku.", call["messages"][0]["content"])
+        self.assertIn("demo: Demo skill that says hello", call["messages"][0]["content"])
+        self.assertIn('Use the "demo" skill', last_user_text(call["messages"]))
+        self.assertIn("please", last_user_text(call["messages"]))
+        self.assertEqual(list(call["skills"]), ["demo"])
+
+    def test_the_skills_line_is_clickable_only_on_its_text_and_lists_every_skill(self):
+        for name, description in [("alpha", "First helper"), ("beta", "Second helper")]:
+            folder = Path(".claude/skills") / name
+            folder.mkdir(parents=True)
+            (folder / "SKILL.md").write_text(f"---\nname: {name}\ndescription: {description}\n---\nDo it.\n")
+
+        def screen(app):
+            parts = []
+            for window in app.layout.find_all_windows():
+                control = window.content
+                if isinstance(control, FormattedTextControl) and callable(control.text):
+                    parts.append(to_plain_text(control.text()))
+            return "\n".join(parts)
+
+        def mouse(kind, column, row):
+            code = {"move": "35M", "click": "0m"}[kind]
+            return f"\x1b[<{code[:-1]};{column};{row}{code[-1]}"
+
+        async def driver(app, pipe, transcript):
+            row = next(i for i, line in enumerate(transcript.plain(app.output.get_size().columns).splitlines()) if "Skills: 2" in line) + 1
+            pipe.send_text(mouse("click", 60, row))
+            await settle(0.2)
+            self.assertNotIn("First helper", screen(app))
+            pipe.send_text(mouse("click", 4, row + 1))
+            await settle(0.2)
+            self.assertNotIn("First helper", screen(app))
+            pipe.send_text(mouse("move", 4, row))
+            await settle(0.2)
+            self.assertIn("Skills: 2 (click to view)", transcript.plain())
+            pipe.send_text(mouse("move", 70, row))
+            await settle(0.2)
+            self.assertNotIn("click to view", transcript.plain())
+            pipe.send_text(mouse("click", 4, row))
+            await settle(0.2)
+            listing = screen(app)
+            for expected in ["Skills", "alpha", "First helper", "beta", "Second helper"]:
+                self.assertIn(expected, listing)
+            pipe.send_text(DOWN + "\r")
+            await wait_for(lambda: app.current_buffer.text == "@beta ")
+            self.assertNotIn("Second helper", screen(app))
+
+        self.run_main(driver, Replies())
+
+    def test_skills_command_and_at_list_show_skills_but_slash_list_does_not(self):
+        folder = Path(".claude/skills/alpha")
+        folder.mkdir(parents=True)
+        (folder / "SKILL.md").write_text("---\nname: alpha\ndescription: First helper\n---\nDo it.\n")
+        Path("alpine.txt").write_text("x")
+
+        def listing(app):
+            for window in app.layout.find_all_windows():
+                control = window.content
+                if isinstance(control, FormattedTextControl) and callable(control.text):
+                    rows = [line for line in to_plain_text(control.text()).splitlines() if line.strip()]
+                    if rows and all(line.startswith((" /", " @", " No matching")) for line in rows):
+                        return rows
+            return []
+
+        async def driver(app, pipe, transcript):
+            pipe.send_text("/")
+            await settle(0.2)
+            self.assertNotIn("alpha", "".join(listing(app)))
+            pipe.send_text("sk")
+            await settle(0.2)
+            self.assertEqual([row.split()[0] for row in listing(app)], ["/skills"])
+            pipe.send_text("\x03")
+            pipe.send_text("@al")
+            await settle(0.2)
+            rows = listing(app)
+            self.assertEqual(rows[0].split()[0], "@alpha")
+            self.assertIn("First helper", rows[0])
+            self.assertEqual(rows[1].split()[0], "@alpine.txt")
+            pipe.send_text("\t")
+            await wait_for(lambda: app.current_buffer.text == "@alpha ")
+
+        self.run_main(driver, Replies())
 
     def test_clicking_outside_any_modal_closes_it(self):
         def screen(app):

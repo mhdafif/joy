@@ -17,6 +17,8 @@ from threading import Event, Lock
 
 from aisuite.utils.tools import Tools
 
+from joy.skills import Skill, load_body
+
 OUTPUT_LIMIT = 20_000
 FILE_LIMIT = 2_000_000
 MAX_TRACKED_FILES = 20
@@ -202,7 +204,7 @@ def is_readonly_command(root: Path, command: str) -> bool:
 
 def create_tools(
     workspace: Path, cancelled: Event, on_change: Callable[[Change], None] | None = None,
-    readonly: bool = False,
+    readonly: bool = False, skills: dict[str, Skill] | None = None,
 ) -> Tools:
     root = workspace.resolve()
 
@@ -306,8 +308,17 @@ def create_tools(
                 record(Change(label, "created", "", updated))
         return result
 
+    extra = []
+    if skills:
+        def skill(name: str) -> str:
+            """Load the full instructions of a skill by its name, then follow them."""
+            if name not in skills:
+                raise ValueError("Unknown skill. Available: " + ", ".join(sorted(skills)))
+            return load_body(skills[name])
+
+        extra.append(skill)
     if not readonly:
-        return Tools([read, write, edit, bash])
+        return Tools([read, write, edit, bash, *extra])
 
     def inspect(command: str, timeout: int = 30) -> str:
         """Run a read-only command in the workspace (ls, cat, head, tail, grep, rg, find, tree, wc, file, stat,
@@ -318,4 +329,4 @@ def create_tools(
         return bash(command, timeout)
 
     inspect.__name__ = "bash"
-    return Tools([read, inspect])
+    return Tools([read, inspect, *extra])

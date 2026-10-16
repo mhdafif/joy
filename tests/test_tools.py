@@ -5,6 +5,8 @@ import tempfile
 import unittest
 from pathlib import Path
 from threading import Event
+
+from joy.skills import Skill
 from joy.tools import _check_readonly, _replace, create_tools, is_readonly_command
 
 
@@ -108,6 +110,18 @@ class ApprovalAndSkillTest(unittest.TestCase):
 
     def run_tool(self, tools, tool_name, **arguments):
         return tools.execute({'function': {'name': tool_name, 'arguments': json.dumps(arguments)}})[0]
+
+    def test_skill_tool_loads_a_skill_and_rejects_unknown_names(self):
+        folder = self.root / 'demo'
+        folder.mkdir()
+        file = folder / 'SKILL.md'
+        file.write_text('---\nname: demo\ndescription: Say hello\n---\nSay HELLO-FROM-SKILL.\n')
+        tools = create_tools(self.root, Event(), skills={'demo': Skill('demo', 'Say hello', file)})
+        self.assertIn('skill', [tool['function']['name'] for tool in tools.tools()])
+        self.assertIn('HELLO-FROM-SKILL', self.run_tool(tools, 'skill', name='demo'))
+        with self.assertRaises(ValueError):
+            self.run_tool(tools, 'skill', name='missing')
+        self.assertNotIn('skill', [tool['function']['name'] for tool in create_tools(self.root, Event()).tools()])
 
     def test_bash_changes_are_reported(self):
         recorded = []

@@ -36,6 +36,7 @@ class StepsTest(unittest.TestCase):
         self.assertEqual(summarize([read, {'name': 'read', 'detail': 'b.py'}]), 'Read 2 files')
         steps = [read, {'name': 'edit', 'detail': 'a.py'}, {'name': 'bash', 'detail': 'pytest'}, {'name': 'bash', 'detail': 'ls'}]
         self.assertEqual(summarize(steps), 'Read a.py, edited a.py and ran 2 commands')
+        self.assertEqual(summarize([{'name': 'skill', 'detail': 'demo'}]), 'Loaded the demo skill')
         self.assertEqual(summarize([{'name': 'mystery'}, {'name': 'other'}]), 'Used 2 other tools')
 
     def test_one_step_is_a_plain_line_and_several_fold_into_an_accordion(self):

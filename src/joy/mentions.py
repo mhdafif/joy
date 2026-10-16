@@ -1,3 +1,5 @@
+"""Find files to mention with @ and attach their contents to a message."""
+
 import re
 import subprocess
 import time
@@ -5,9 +7,6 @@ from collections.abc import Collection
 from pathlib import Path
 
 from joy.tools import _read_text
-"""Find files to mention with @ and attach their contents to a message."""
-
-
 
 MENTION = re.compile(r"(?<!\S)@(\S+)")
 SKIPPED_DIRECTORIES = {".git", "node_modules", ".venv", "venv", "__pycache__", "dist", "build", ".next", "target"}
@@ -103,6 +102,16 @@ def active_mention(text: str, cursor: int) -> tuple[int, str] | None:
     if token.startswith("@"):
         return start, token[1:]
     return None
+
+
+def mentioned_skills(message: str, names: Collection[str]) -> list[str]:
+    found: list[str] = []
+    for match in MENTION.finditer(message):
+        raw = match.group(1)
+        name = next((candidate for candidate in dict.fromkeys((raw, raw.rstrip(TRAILING))) if candidate in names), None)
+        if name is not None and name not in found:
+            found.append(name)
+    return found
 
 
 def references(root: Path, message: str, skills: Collection[str]) -> list[tuple[int, int, str]]:

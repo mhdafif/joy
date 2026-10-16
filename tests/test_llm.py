@@ -12,6 +12,7 @@ import httpx
 from openai import OpenAI
 
 from joy.llm import MODEL, ToolEvent, stream_reply
+from joy.skills import Skill
 from joy.tools import Change
 
 
@@ -191,3 +192,8 @@ class LlmTest(unittest.IsolatedAsyncioTestCase):
     async def test_plan_mode_offers_only_read_and_bash(self):
         _, payloads, _ = await self.run_two_step_reply([self.tool_call('read', path='x')], readonly=True)
         self.assertEqual([tool['name'] for tool in payloads[0]['tools']], ['read', 'bash'])
+
+    async def test_skills_add_a_skill_tool(self):
+        skill = Skill('demo', 'Demo', Path('/nowhere/SKILL.md'))
+        _, payloads, _ = await self.run_two_step_reply([self.tool_call('read', path='x')], skills={'demo': skill})
+        self.assertEqual([tool['name'] for tool in payloads[0]['tools']], ['read', 'write', 'edit', 'bash', 'skill'])
