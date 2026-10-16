@@ -34,6 +34,23 @@ class Usage:
     tokens: int
 
 
+class Decision:
+    def __init__(self) -> None:
+        self.event = Event()
+        self.allowed = False
+
+    def resolve(self, allowed: bool) -> None:
+        self.allowed = allowed
+        self.event.set()
+
+
+@dataclass(frozen=True)
+class Approval:
+    name: str
+    detail: str
+    decision: Decision
+
+
 def _describe(arguments: str) -> str:
     try:
         values = json.loads(arguments)
@@ -92,10 +109,10 @@ def list_models(connection: Connection | None = None) -> list[str]:
 
 async def stream_reply(
     messages: list[dict], model: str | None = None, connection: Connection | None = None,
-    readonly: bool = False, skills: dict | None = None,
-) -> AsyncIterator[str | ToolEvent | Change | Usage]:
+    readonly: bool = False, skills: dict | None = None, ask_approval: bool = False,
+) -> AsyncIterator[str | ToolEvent | Change | Usage | Approval]:
     model = model or DEFAULT_MODEL
-    result: Queue[str | ToolEvent | Change | Usage | Exception | None] = Queue()
+    result: Queue[str | ToolEvent | Change | Usage | Approval | Exception | None] = Queue()
     cancelled = Event()
     workspace = Path.cwd()
 
@@ -103,7 +120,19 @@ async def stream_reply(
         client = None
         try:
             client = OpenAI(timeout=60.0, max_retries=0, **(connection.client_options() if connection else {}))
-            toolbox = create_tools(workspace, cancelled, result.put, readonly, skills=skills)
+
+            def approve(name: str, detail: str) -> bool:
+                decision = Decision()
+                result.put(Approval(name, detail, decision))
+                while not decision.event.wait(0.1):
+                    if cancelled.is_set():
+                        return False
+                return decision.allowed
+
+            toolbox = create_tools(
+                workspace, cancelled, result.put, readonly,
+                approve if ask_approval and not readonly else None, skills,
+            )
             conversation = list(messages)
             for _ in range(16):
                 if cancelled.is_set():

@@ -10,8 +10,7 @@ from unittest.mock import patch
 
 import httpx
 from openai import OpenAI
-
-from joy.llm import MODEL, ToolEvent, stream_reply
+from joy.llm import MODEL, Approval, ToolEvent, stream_reply
 from joy.skills import Skill
 from joy.tools import Change
 
@@ -164,7 +163,7 @@ class LlmTest(unittest.IsolatedAsyncioTestCase):
         }
         return event
 
-    async def run_two_step_reply(self, first_output, **options):
+    async def run_two_step_reply(self, first_output, approve_with=True, **options):
         payloads = []
 
         def respond(request):
@@ -179,6 +178,8 @@ class LlmTest(unittest.IsolatedAsyncioTestCase):
                 chunks = []
                 async for chunk in stream_reply([{'role': 'user', 'content': 'Go'}], **options):
                     chunks.append(chunk)
+                    if isinstance(chunk, Approval):
+                        chunk.decision.resolve(approve_with)
             return chunks, payloads, Path(directory)
 
     async def test_long_commands_are_flattened_and_shortened_in_the_step_detail(self):
@@ -197,3 +198,20 @@ class LlmTest(unittest.IsolatedAsyncioTestCase):
         skill = Skill('demo', 'Demo', Path('/nowhere/SKILL.md'))
         _, payloads, _ = await self.run_two_step_reply([self.tool_call('read', path='x')], skills={'demo': skill})
         self.assertEqual([tool['name'] for tool in payloads[0]['tools']], ['read', 'write', 'edit', 'bash', 'skill'])
+
+    async def test_commands_wait_for_approval_and_obey_the_answer(self):
+        for allowed in (True, False):
+            with self.subTest(allowed=allowed):
+                chunks, _, directory = await self.run_two_step_reply(
+                    [self.tool_call('bash', command='touch made.txt')], ask_approval=True, approve_with=allowed,
+                )
+                requests = [c for c in chunks if isinstance(c, Approval)]
+                self.assertEqual([(r.name, r.detail) for r in requests], [('bash', 'touch made.txt')])
+                events = [c for c in chunks if isinstance(c, ToolEvent)]
+                self.assertEqual(events[-1].status, 'finished' if allowed else 'failed')
+                if not allowed:
+                    self.assertIn('declined', events[-1].detail)
+
+    async def test_read_only_commands_never_ask(self):
+        chunks, _, _ = await self.run_two_step_reply([self.tool_call('bash', command='ls')], ask_approval=True)
+        self.assertFalse([c for c in chunks if isinstance(c, Approval)])

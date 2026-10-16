@@ -111,6 +111,23 @@ class ApprovalAndSkillTest(unittest.TestCase):
     def run_tool(self, tools, tool_name, **arguments):
         return tools.execute({'function': {'name': tool_name, 'arguments': json.dumps(arguments)}})[0]
 
+    def test_bash_asks_only_for_commands_that_are_not_read_only(self):
+        asked = []
+
+        def approve(name, detail):
+            asked.append((name, detail))
+            return detail != 'touch denied.txt'
+
+        tools = create_tools(self.root, Event(), approve=approve)
+        self.run_tool(tools, 'bash', command='ls')
+        self.assertEqual(asked, [])
+        self.run_tool(tools, 'bash', command='touch allowed.txt')
+        self.assertEqual(asked, [('bash', 'touch allowed.txt')])
+        self.assertTrue((self.root / 'allowed.txt').exists())
+        with self.assertRaises(PermissionError):
+            self.run_tool(tools, 'bash', command='touch denied.txt')
+        self.assertFalse((self.root / 'denied.txt').exists())
+
     def test_skill_tool_loads_a_skill_and_rejects_unknown_names(self):
         folder = self.root / 'demo'
         folder.mkdir()

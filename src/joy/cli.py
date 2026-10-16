@@ -48,7 +48,7 @@ from joy.mentions import (
     active_mention, expand as expand_mentions, mentioned_skills, references, search as search_paths, workspace_paths,
 )
 from joy.markdown import JoyMarkdown
-from joy.llm import DEFAULT_MODEL, ToolEvent, Usage, list_models, stream_reply
+from joy.llm import DEFAULT_MODEL, Approval, ToolEvent, Usage, list_models, stream_reply
 from joy.settings import load_settings, save_settings
 from joy.skills import discover as discover_skills
 from joy.theme import PALETTES, active, t, use
@@ -61,6 +61,12 @@ INPUT_MAX_ROWS = 10
 PICKER_ROWS = 8
 MENTION_ROWS = 8
 SUGGESTION_ROWS = 5
+APPROVAL_CHOICES = (
+    ("once", "Allow once"),
+    ("always", "Always allow this exact command"),
+    ("session", "Allow all commands this session"),
+    ("deny", "Deny"),
+)
 PLAN_NOTE = "Plan mode: no files changed."
 PLAN_NOTE_REDUNDANT = re.compile(r"read-only|no files (were |have been )?(changed|modified)|nothing (was|has been) changed", re.I)
 QUEUE_LIMIT = 5
@@ -293,6 +299,9 @@ def main(argv: list[str] | None = None) -> None:
     picker_subtitle = ""
     picker_searchable = True
     picker_dismiss: Callable[[], None] | None = None
+    approve_all = False
+    approval: tuple[str, Callable[[str], None]] | None = None
+    approval_index = 0
     status_label = "Thinking…"
     skills = discover_skills(Path(workspace))
     instruction_files = load_instructions(Path(workspace))[1]
@@ -333,7 +342,10 @@ def main(argv: list[str] | None = None) -> None:
         suggestion_top = 0
         picked = 0
 
-    buffer = Buffer(multiline=True, history=InMemoryHistory(), on_text_changed=reset_selection)
+    buffer = Buffer(
+        multiline=True, history=InMemoryHistory(), on_text_changed=reset_selection,
+        read_only=Condition(lambda: approval is not None),
+    )
     modal_buffer = Buffer(on_text_changed=reset_selection)
 
     def mentioning() -> bool:
@@ -343,7 +355,7 @@ def main(argv: list[str] | None = None) -> None:
         return references(Path(workspace), text, skills)
 
     def suggestions() -> list[Suggestion]:
-        if picking or forming:
+        if picking or forming or approval is not None:
             return []
         mention = active_mention(buffer.text, buffer.cursor_position)
         if mention is not None:
@@ -1014,6 +1026,68 @@ def main(argv: list[str] | None = None) -> None:
                     part["error"] = event.detail
                 break
 
+    def request_approval(request: Approval) -> None:
+        nonlocal approve_all, status_label
+        allowed_before = load_settings().get("allowed_commands", [])
+        if approve_all or request.detail in allowed_before:
+            request.decision.resolve(True)
+            return
+        status_label = "Waiting for your approval…"
+
+        def decide(value: str) -> None:
+            nonlocal approve_all, status_label
+            status_label = "Thinking…"
+            if value == "always":
+                values = load_settings()
+                values["allowed_commands"] = [*values.get("allowed_commands", []), request.detail]
+                try:
+                    save_settings(values)
+                except OSError:
+                    pass
+            elif value == "session":
+                approve_all = True
+            request.decision.resolve(value != "deny")
+
+        nonlocal approval, approval_index
+        approval = (request.detail, decide)
+        approval_index = 0
+        get_app().invalidate()
+
+    def resolve_approval(value: str) -> None:
+        nonlocal approval
+        if approval is None:
+            return
+        decide = approval[1]
+        approval = None
+        decide(value)
+        get_app().invalidate()
+
+    def approval_rows() -> list[list[tuple]]:
+        if approval is None:
+            return []
+        width = get_app().output.get_size().columns
+        lines = textwrap.wrap(approval[0], max(width - 4, 20), replace_whitespace=False) or [""]
+        if len(lines) > 3:
+            lines = [*lines[:2], lines[2][:max(width - 5, 19)] + "…"]
+        rows: list[list[tuple]] = [[(t.row_skill, " Allow this command?".ljust(width))]]
+        rows.extend([(t.row, f"  {line}".ljust(width))] for line in lines)
+        for index, (value, label) in enumerate(APPROVAL_CHOICES):
+            def pick(mouse_event: MouseEvent, value=value, index=index):
+                nonlocal approval_index
+                if mouse_event.event_type == MouseEventType.MOUSE_MOVE:
+                    approval_index = index
+                elif mouse_event.event_type == MouseEventType.MOUSE_UP:
+                    resolve_approval(value)
+                else:
+                    return NotImplemented
+                get_app().invalidate()
+                return None
+
+            marker = "● " if index == approval_index else "  "
+            rows.append([(t.selected if index == approval_index else t.row, f" {marker}{index + 1}  {label}".ljust(width), pick)])
+        rows.append([(t.row_muted, " Enter to choose · 1-4 picks · Esc denies".ljust(width))])
+        return rows
+
     async def run_turn(
         messages: list[dict[str, str]], used_model: str, used_connection: Connection, readonly: bool,
     ) -> None:
@@ -1021,7 +1095,7 @@ def main(argv: list[str] | None = None) -> None:
         outcome = "done"
         failure: Exception | None = None
         try:
-            async with aclosing(stream_reply(messages, used_model, used_connection, readonly, skills or None)) as stream:
+            async with aclosing(stream_reply(messages, used_model, used_connection, readonly, skills or None, True)) as stream:
                 async for chunk in stream:
                     if isinstance(chunk, ToolEvent):
                         used_tools = True
@@ -1030,6 +1104,8 @@ def main(argv: list[str] | None = None) -> None:
                         pending.append(chunk)
                     elif isinstance(chunk, Usage):
                         tokens += chunk.tokens
+                    elif isinstance(chunk, Approval):
+                        request_approval(chunk)
                     else:
                         answer += chunk
                         if parts and parts[-1]["t"] == "text":
@@ -1314,6 +1390,31 @@ def main(argv: list[str] | None = None) -> None:
     def scroll_down(event: KeyPressEvent) -> None:
         transcript.page(-1)
 
+    approving = Condition(lambda: approval is not None)
+
+    @bindings.add("up", filter=approving)
+    def approval_up(event: KeyPressEvent) -> None:
+        nonlocal approval_index
+        approval_index = (approval_index - 1) % len(APPROVAL_CHOICES)
+
+    @bindings.add("down", filter=approving)
+    @bindings.add("tab", filter=approving)
+    def approval_down(event: KeyPressEvent) -> None:
+        nonlocal approval_index
+        approval_index = (approval_index + 1) % len(APPROVAL_CHOICES)
+
+    @bindings.add("enter", filter=approving)
+    def approval_choose(event: KeyPressEvent) -> None:
+        resolve_approval(APPROVAL_CHOICES[approval_index][0])
+
+    @bindings.add("escape", filter=approving, eager=True)
+    @bindings.add("c-c", filter=approving)
+    def approval_deny(event: KeyPressEvent) -> None:
+        resolve_approval("deny")
+
+    for number, (value, _) in enumerate(APPROVAL_CHOICES, 1):
+        bindings.add(str(number), filter=approving)(lambda event, value=value: resolve_approval(value))
+
     input_window = Window(
         BufferControl(buffer, input_processors=[ReferenceProcessor(find_references), PlaceholderProcessor(lambda: "Ask Joy to do something…")]),
         height=Dimension(min=1, max=INPUT_MAX_ROWS),
@@ -1403,6 +1504,14 @@ def main(argv: list[str] | None = None) -> None:
         def bottom(self, value) -> None:
             pass
 
+    approval_float = OverlayFloat(
+        content=ConditionalContainer(
+            Window(FormattedTextControl(lambda: join_rows(approval_rows())), height=lambda: len(approval_rows())),
+            filter=Condition(lambda: approval is not None),
+        ),
+        left=0, right=0,
+    )
+
     suggestion_float = OverlayFloat(
         content=ConditionalContainer(
             Window(FormattedTextControl(render_suggestions), height=lambda: len(suggestion_rows())),
@@ -1420,6 +1529,7 @@ def main(argv: list[str] | None = None) -> None:
         ]),
         floats=[
             suggestion_float,
+            approval_float,
             Float(
                 content=ConditionalContainer(Window(Backdrop(), style="dim"), filter=modal_open),
                 left=0, right=0, top=0, bottom=0, transparent=True,

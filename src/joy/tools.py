@@ -204,7 +204,8 @@ def is_readonly_command(root: Path, command: str) -> bool:
 
 def create_tools(
     workspace: Path, cancelled: Event, on_change: Callable[[Change], None] | None = None,
-    readonly: bool = False, skills: dict[str, Skill] | None = None,
+    readonly: bool = False, approve: Callable[[str, str], bool] | None = None,
+    skills: dict[str, Skill] | None = None,
 ) -> Tools:
     root = workspace.resolve()
 
@@ -273,6 +274,8 @@ def create_tools(
             raise ValueError("Provide a command and a timeout between 1 and 300 seconds.")
         if cancelled.is_set():
             raise InterruptedError("Cancelled.")
+        if approve is not None and not is_readonly_command(root, command) and not approve("bash", command):
+            raise PermissionError("The user declined to run this command.")
         named = _named_files(root, command)
         before = {target: (label, target.exists(), _read_text(target)) for target, label in named.items()}
         with tempfile.TemporaryFile() as output:

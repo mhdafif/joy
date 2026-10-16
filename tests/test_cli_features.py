@@ -2,10 +2,14 @@ import asyncio
 import re
 from pathlib import Path
 from unittest.mock import patch
+
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.formatted_text import to_plain_text
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
+
 from harness import DOWN, ESCAPE, FOOTER, UP, CliCase, Replies, last_user_text, settle, wait_for
-from joy.llm import ToolEvent
+from joy.llm import Approval, Decision, ToolEvent
 from joy.settings import load_settings
 from joy.sessions import list_sessions
 from joy.theme import active
@@ -396,6 +400,104 @@ class ModesAndContextTest(CliCase):
 
         self.run_main(driver, Replies())
         self.assertTrue(seen)
+
+
+class ApprovalTest(CliCase):
+    def test_commands_ask_first_and_the_answers_are_remembered(self):
+        outcomes = []
+
+        def turn(command):
+            async def behave(call):
+                decision = Decision()
+                yield Approval("bash", command, decision)
+                while not decision.event.is_set():
+                    await asyncio.sleep(0.01)
+                outcomes.append((command, decision.allowed))
+                yield "ok"
+            return behave
+
+        replies = Replies(*[turn(c) for c in ["touch a", "touch b", "touch b", "touch c", "touch d", "touch e"]])
+
+        async def driver(app, pipe, transcript):
+            async def ask(keys, number):
+                await say(pipe, "go")
+                await wait_for(lambda: len(replies.calls) == number)
+                if keys is not None:
+                    await settle(0.25)
+                    pipe.send_text(keys)
+                await wait_for(lambda: len(outcomes) == number)
+                await wait_for(lambda: transcript.plain().count(FOOTER) == number)
+
+            await ask("\r", 1)
+            self.assertNotIn("allowed_commands", load_settings())
+            await ask(DOWN + "\r", 2)
+            self.assertEqual(load_settings()["allowed_commands"], ["touch b"])
+            await ask(None, 3)
+            await ask(ESCAPE, 4)
+            await ask(DOWN + DOWN + "\r", 5)
+            await ask(None, 6)
+
+        self.run_main(driver, replies)
+        self.assertEqual(outcomes, [
+            ("touch a", True), ("touch b", True), ("touch b", True),
+            ("touch c", False), ("touch d", True), ("touch e", True),
+        ])
+
+    def test_the_approval_prompt_floats_above_the_input_and_takes_keys_and_clicks(self):
+        outcomes = []
+
+        def turn(command):
+            async def behave(call):
+                decision = Decision()
+                yield Approval("bash", command, decision)
+                while not decision.event.is_set():
+                    await asyncio.sleep(0.01)
+                outcomes.append((command, decision.allowed))
+                yield "ok"
+            return behave
+
+        replies = Replies(turn("rm -rf build"), turn("touch b"), turn("touch c"))
+
+        def prompt(app):
+            for window in app.layout.find_all_windows():
+                control = window.content
+                if isinstance(control, FormattedTextControl) and callable(control.text):
+                    fragments = control.text()
+                    if "Allow this command?" in to_plain_text(fragments):
+                        return fragments
+            return None
+
+        async def driver(app, pipe, transcript):
+            window = next(w for w in app.layout.find_all_windows() if isinstance(w.content, Transcript))
+            await settle(0.2)
+            before = window.render_info.window_height
+            await say(pipe, "go")
+            await wait_for(lambda: prompt(app) is not None)
+            await settle(0.2)
+            shown = to_plain_text(prompt(app))
+            self.assertIn("rm -rf build", shown)
+            for number, label in enumerate(["Allow once", "Always allow this exact command", "Allow all commands this session", "Deny"], 1):
+                self.assertIn(f"{number}  {label}", shown)
+            self.assertEqual(window.render_info.window_height, before)
+            pipe.send_text("typed")
+            await settle(0.1)
+            self.assertEqual(app.current_buffer.text, "")
+            pipe.send_text("4")
+            await wait_for(lambda: len(outcomes) == 1 and prompt(app) is None)
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            await say(pipe, "go")
+            await wait_for(lambda: prompt(app) is not None)
+            handler = next(f[2] for f in prompt(app) if "Allow once" in f[1])
+            handler(MouseEvent(Point(1, 0), MouseEventType.MOUSE_UP, MouseButton.LEFT, frozenset()))
+            await wait_for(lambda: len(outcomes) == 2 and prompt(app) is None)
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 2)
+            await say(pipe, "go")
+            await wait_for(lambda: prompt(app) is not None)
+            pipe.send_text(ESCAPE)
+            await wait_for(lambda: len(outcomes) == 3)
+
+        self.run_main(driver, replies)
+        self.assertEqual(outcomes, [("rm -rf build", False), ("touch b", True), ("touch c", False)])
 
 
 class ConnectionsAndSettingsTest(CliCase):
