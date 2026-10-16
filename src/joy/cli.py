@@ -70,6 +70,14 @@ CONNECT_STEPS = (
 )
 RESUME_FLAGS = ("-c", "--continue")
 NEWLINE_KEY = "Option+Enter" if sys.platform == "darwin" else "Alt+Enter"
+LOGO = (
+    "     ██╗ ██████╗ ██╗   ██╗",
+    "     ██║██╔═══██╗╚██╗ ██╔╝",
+    "     ██║██║   ██║ ╚████╔╝ ",
+    "██   ██║██║   ██║  ╚██╔╝  ",
+    "╚█████╔╝╚██████╔╝   ██║   ",
+    " ╚════╝  ╚═════╝    ╚═╝   ",
+)
 COMMANDS = dict(sorted({
     "/expand": "show a full diff",
     "/build": "build mode: Joy can change files",
@@ -673,13 +681,25 @@ def main(argv: list[str] | None = None) -> None:
             record({"t": "changes", "items": [asdict(change) for change in merged]})
 
     def show_banner() -> None:
-        transcript.add(Text("Joy", style="bold cyan"))
-        transcript.add(Text(""))
-        transcript.add(Text.assemble(
-            ("Type ", "dim"), ("/", "bold"),
-            (" to see all commands · Ctrl-C cancels input · Ctrl-D exits · Ctrl-O shows or hides steps", "dim"),
+        tips = Table.grid(padding=(0, 2))
+        tips.add_column(style=t.accent, no_wrap=True)
+        tips.add_column(style=t.muted)
+        for key, description in (
+            ("Tab", "switch between Build and Plan mode"),
+            ("@", "tag a file or folder in your message"),
+            ("/model", "choose the model"),
+            ("/connect", "add another endpoint"),
+            ("/theme", "change the colors"),
+            ("/session", "switch to an earlier session"),
+            ("Ctrl+O", "show or hide the steps"),
+            ("Esc", "stop a reply"),
+        ):
+            tips.add_row(key, description)
+        transcript.add(Group(
+            Padding(Text("\n".join(LOGO), style=f"bold {t.accent}"), (1, 0, 0, 2)),
+            Padding(Text("Joy — a terminal coding agent", style=t.muted), (0, 0, 1, 2)),
+            Padding(tips, (0, 0, 1, 2)),
         ))
-        transcript.add(Text(""))
 
     def reset_view() -> None:
         nonlocal last_kind, last_group
