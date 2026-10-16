@@ -18,17 +18,18 @@ from prompt_toolkit.formatted_text import StyleAndTextTuples
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.key_binding.key_processor import KeyPressEvent
-from prompt_toolkit.layout import ConditionalContainer, Dimension, Float, FloatContainer, HSplit, Layout, Window
+from prompt_toolkit.layout import (
+    ConditionalContainer, Dimension, Float, FloatContainer, HSplit, Layout, VSplit, Window,
+)
 from prompt_toolkit.layout.controls import BufferControl, FormattedTextControl
 from prompt_toolkit.layout.processors import (
     ConditionalProcessor, PasswordProcessor, Processor, Transformation, TransformationInput,
 )
 from prompt_toolkit.output import ColorDepth
-from prompt_toolkit.styles import Style
+from prompt_toolkit.styles import DynamicStyle, Style
 from prompt_toolkit.utils import get_cwidth
-from prompt_toolkit.widgets import Box, Frame
+from prompt_toolkit.widgets import Box
 from rich.console import Console, Group, RenderableType
-from rich.markdown import Markdown
 from rich.padding import Padding
 from rich.text import Text
 
@@ -36,7 +37,10 @@ from joy.connections import (
     RECENT_LIMIT, Connection, load_connections, load_recent, load_selection, save_connection, save_selection,
 )
 from joy.diffview import COLLAPSED_LINES, merge_changes, render_change
+from joy.markdown import JoyMarkdown
 from joy.llm import DEFAULT_MODEL, ToolEvent, Usage, list_models, stream_reply
+from joy.settings import load_settings, save_settings
+from joy.theme import PALETTES, active, t, use
 from joy.sessions import Session, latest_session, list_sessions, new_session, save_session
 from joy.steps import StepGroup
 from joy.tools import Change
@@ -55,6 +59,7 @@ NEWLINE_KEY = "Option+Enter" if sys.platform == "darwin" else "Alt+Enter"
 COMMANDS = dict(sorted({
     "/expand": "show a full diff",
     "/session": "switch to another session",
+    "/theme": "choose the color theme",
     "/new": "start a new session",
     "/clear": "start a new session",
     "/model": "choose the model",
@@ -105,7 +110,7 @@ def format_date(timestamp: float) -> str:
 
 
 def render_answer(text: str) -> RenderableType:
-    return Padding(Markdown(text.lstrip()), (0, 0, 0, 1))
+    return Padding(JoyMarkdown(text.lstrip()), (0, 0, 0, 1))
 
 
 def render_parts(parts: list[dict]) -> RenderableType:
@@ -134,7 +139,9 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="joy", description="A terminal coding agent.")
     parser.add_argument("-c", "--continue", dest="resume", action="store_true",
                         help="continue the last session in this folder")
+    parser.add_argument("--theme", choices=list(PALETTES), help="try a color theme for this run without saving it")
     arguments = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    use(arguments.theme or load_settings().get("theme"))
     console = Console(
         color_system="truecolor" if sys.stdout.isatty() else None,
         no_color=False,
@@ -228,15 +235,15 @@ def main(argv: list[str] | None = None) -> None:
         width = get_app().output.get_size().columns
         rows: list[list[tuple[str, str]]] = []
         if not options:
-            rows.append([("#6b6b6b", f"Enter sends · {NEWLINE_KEY} or Ctrl+J adds a new line")])
+            rows.append([(t.subtle, f"Enter sends · {NEWLINE_KEY} or Ctrl+J adds a new line")])
             rows.append([("", " ")])
         for index, command in enumerate(options):
             if index == current_index:
-                rows.append([("bg:#e8975a #1a1a1a", f" {command:<10} {COMMANDS[command]}".ljust(width))])
+                rows.append([(t.selected, f" {command:<10} {COMMANDS[command]}".ljust(width))])
             else:
                 rows.append([
-                    ("bg:#1a1a1a bold #ffffff", f" {command:<10}"),
-                    ("bg:#1a1a1a #808080", f" {COMMANDS[command]}".ljust(width - 11)),
+                    (t.row_strong, f" {command:<10}"),
+                    (t.row_muted, f" {COMMANDS[command]}".ljust(width - 11)),
                 ])
         return join_rows(rows)
 
@@ -245,7 +252,7 @@ def main(argv: list[str] | None = None) -> None:
 
     def title_row(title: str) -> StyleAndTextTuples:
         gap = " " * max(1, modal_width() - 4 - get_cwidth(title) - 3)
-        return [("bold #ffffff", title), ("", gap), ("#808080", "esc")]
+        return [(t.strong, title), ("", gap), (t.muted, "esc")]
 
     def picker_rows() -> list[list[tuple[str, str]]]:
         items = visible_items()
@@ -270,16 +277,16 @@ def main(argv: list[str] | None = None) -> None:
         start = max(0, min(selected_entry - limit // 2, len(entries) - limit))
         rows: list[list[tuple[str, str]]] = []
         if not entries:
-            rows.append([("#808080", "No matches")])
+            rows.append([(t.muted, "No matches")])
         for kind, index, text in entries[start:start + limit]:
             if kind == "gap":
                 rows.append([("", " ")])
                 continue
             if kind == "header":
-                rows.append([("bold #a78bfa", text)])
+                rows.append([(t.group, text)])
                 continue
             if kind == "note":
-                rows.append([("#808080", f"  {text}")])
+                rows.append([(t.muted, f"  {text}")])
                 continue
             item = items[index]
             marker = "● " if item.current else "  "
@@ -289,26 +296,26 @@ def main(argv: list[str] | None = None) -> None:
                 name = name[:-2] + "…"
             gap = " " * max(1, width - get_cwidth(name) - get_cwidth(item.detail) - 2)
             if index == current_index:
-                rows.append([("bg:#e8975a #1a1a1a", f"{marker}{name}{gap}{item.detail}")])
+                rows.append([(t.selected, f"{marker}{name}{gap}{item.detail}")])
             else:
-                label_style = "#e8975a" if item.current else "#ffffff"
-                rows.append([(label_style, f"{marker}{name}"), ("", gap), ("#808080", item.detail)])
+                label_style = t.accent if item.current else t.text
+                rows.append([(label_style, f"{marker}{name}"), ("", gap), (t.muted, item.detail)])
         return rows
 
     def form_rows() -> list[list[tuple[str, str]]]:
         rows: list[list[tuple[str, str]]] = [
-            [("#808080", f"{CONNECT_STEPS[index][0]}  "), ("#d4d4d4", value)]
+            [(t.muted, f"{CONNECT_STEPS[index][0]}  "), (t.text_soft, value)]
             for index, value in enumerate(form_values)
         ]
         label, _, _ = CONNECT_STEPS[form_index]
-        rows.append([("bold #a78bfa", label), ("#808080", f"  step {form_index + 1} of {len(CONNECT_STEPS)}")])
+        rows.append([(t.group, label), (t.muted, f"  step {form_index + 1} of {len(CONNECT_STEPS)}")])
         return rows
 
     def render_status() -> StyleAndTextTuples:
         return [
-            ("fg:ansigreen", "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 10) % 10]),
+            (t.success, "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"[int(time.monotonic() * 10) % 10]),
             ("", " Thinking…"),
-            ("fg:#808080", f"  esc to stop · {format_elapsed(time.monotonic() - started)}"),
+            (t.muted, f"  esc to stop · {format_elapsed(time.monotonic() - started)}"),
             ("", "\n "),
         ]
 
@@ -323,9 +330,9 @@ def main(argv: list[str] | None = None) -> None:
         source = connection.name if len(connections) > 1 else ""
         used = get_cwidth(model) + (get_cwidth(source) + 1 if source else 0)
         gap = max(2, width - get_cwidth(folder) - used - 2)
-        fragments = [("#808080", f" {folder}"), ("", " " * gap), ("#9a9a9a", model)]
+        fragments = [(t.muted, f" {folder}"), ("", " " * gap), (t.text_dim, model)]
         if source:
-            fragments.append(("#6b6b6b", f" {source}"))
+            fragments.append((t.subtle, f" {source}"))
         return [*fragments, ("", " ")]
 
     def emit(renderable: RenderableType | None = None, on_click: Callable[[Block], None] | None = None) -> Block:
@@ -385,7 +392,7 @@ def main(argv: list[str] | None = None) -> None:
             emit(Padding(
                 Text("› " + event["text"].replace("\n", "\n  ")),
                 (1, 1),
-                style="#ffffff on #393939",
+                style=t.message,
             ))
             emit()
         elif kind == "changes":
@@ -398,6 +405,7 @@ def main(argv: list[str] | None = None) -> None:
             details = [event["model"], format_elapsed(event["elapsed"])]
             if event.get("tokens"):
                 details.append(format_tokens(event["tokens"]))
+            emit()
             emit(Padding(Text(" | ".join(details), style="dim"), (0, 0, 0, 1)))
             emit()
         elif kind == "answer":
@@ -413,7 +421,7 @@ def main(argv: list[str] | None = None) -> None:
             emit(Text("Response cancelled.", style="dim"))
             emit()
         elif kind == "error":
-            emit(Text(event["text"], style="red"))
+            emit(Text(event["text"], style=t.danger))
 
     def record(event: dict) -> None:
         nonlocal current
@@ -516,14 +524,35 @@ def main(argv: list[str] | None = None) -> None:
             return
         open_picker("Sessions", [
             PickerItem(session.name, format_date(session.updated), session) for session in found
-        ], pick_session, hint=[("bold #ffffff", "Enter"), ("#808080", " to open")])
+        ], pick_session, hint=[(t.strong, "Enter"), (t.muted, " to open")])
+
+    def set_theme(item: PickerItem) -> None:
+        use(str(item.value))
+        values = load_settings()
+        values["theme"] = str(item.value)
+        try:
+            save_settings(values)
+        except OSError:
+            pass
+        if current is not None:
+            load_session(current)
+        else:
+            reset_view()
+        emit(Text(f"Theme set to {PALETTES[str(item.value)].name}.", style="dim"))
+        emit()
+
+    def open_theme_picker() -> None:
+        open_picker("Select theme", [
+            PickerItem(palette.name, palette.description, palette.key, "", palette.key == active().key)
+            for palette in PALETTES.values()
+        ], set_theme)
 
     def set_model(item: PickerItem) -> None:
         nonlocal connection, model
         name, chosen = item.value
         found = next((entry for entry in connections if entry.name == name), None)
         if found is None:
-            emit(Text(f"Connection {name} no longer exists.", style="red"))
+            emit(Text(f"Connection {name} no longer exists.", style=t.danger))
             emit()
             return
         connection, model = found, chosen
@@ -568,7 +597,7 @@ def main(argv: list[str] | None = None) -> None:
             notes={entry.name: "Loading models…" for entry in connections},
             custom=lambda text: PickerItem(f'Use "{text}"', f"with {connection.name}", (connection.name, text), "Custom"),
             limit=MODEL_ROWS, order=["Recent", *(entry.name for entry in connections), "Custom"],
-            hint=[("bold #ffffff", "Connect an integration"), ("#808080", " ctrl+a")],
+            hint=[(t.strong, "Connect an integration"), (t.muted, " ctrl+a")],
         )
         for entry in connections:
             get_app().create_background_task(load_models(token, entry))
@@ -583,7 +612,7 @@ def main(argv: list[str] | None = None) -> None:
         try:
             replaced = save_connection(entry)
         except OSError as error:
-            emit(Text(f"Could not save the connection: {error}", style="red"))
+            emit(Text(f"Could not save the connection: {error}", style=t.danger))
             emit()
             return
         connections = load_connections()
@@ -748,6 +777,9 @@ def main(argv: list[str] | None = None) -> None:
         if message in ("/new", "/clear"):
             start_new_session()
             return
+        if message == "/theme":
+            open_theme_picker()
+            return
         if message == "/model":
             open_model_picker()
             return
@@ -874,7 +906,7 @@ def main(argv: list[str] | None = None) -> None:
         height=Dimension(min=1, max=INPUT_MAX_ROWS),
         wrap_lines=True,
         dont_extend_height=True,
-        style="bg:#393939 #ffffff",
+        style=lambda: t.input_box,
         get_line_prefix=lambda line, wrap: "› " if line == 0 and wrap == 0 else "  ",
     )
 
@@ -909,25 +941,31 @@ def main(argv: list[str] | None = None) -> None:
         blank(),
         text_window(lambda: join_rows(form_rows()), lambda: len(form_rows())),
         form_input,
-        text_window(lambda: [("#f87171", form_error or " ")]),
+        text_window(lambda: [(t.danger, form_error or " ")]),
         blank(),
-        text_window(lambda: [("bold #ffffff", "Enter"), ("#808080", " to continue")]),
+        text_window(lambda: [(t.strong, "Enter"), (t.muted, " to continue")]),
     ])
 
     def modal_float(body: HSplit, active: Condition) -> Float:
         return Float(
             content=ConditionalContainer(
-                Box(body, padding_left=2, padding_right=2, padding_top=1, padding_bottom=1, style="bg:#1a1a1a"),
+                Box(body, padding_left=2, padding_right=2, padding_top=1, padding_bottom=1, style=lambda: t.overlay_bg),
                 filter=active,
             ),
             width=modal_width,
         )
 
+    input_box = HSplit([
+        Window(height=1, style=lambda: t.surface_bg),
+        VSplit([Window(width=1, style=lambda: t.surface_bg), input_window, Window(width=1, style=lambda: t.surface_bg)]),
+        Window(height=1, style=lambda: t.surface_bg),
+    ])
+
     root = FloatContainer(
         content=HSplit([
             Window(transcript, always_hide_cursor=True),
             Window(FormattedTextControl(render_menu), height=menu_height),
-            Frame(input_window),
+            input_box,
             Window(FormattedTextControl(render_footer), height=1),
         ]),
         floats=[modal_float(picker_modal, picking_open), modal_float(form_modal, forming_open)],
@@ -938,10 +976,7 @@ def main(argv: list[str] | None = None) -> None:
         full_screen=True,
         mouse_support=True,
         color_depth=ColorDepth.TRUE_COLOR,
-        style=Style.from_dict({
-            "frame.border": "bg:#393939 #393939",
-            "placeholder": "#808080",
-        }),
+        style=DynamicStyle(lambda: Style.from_dict({"placeholder": t.muted})),
     )
     app.timeoutlen = 0.25
     app.ttimeoutlen = 0.05

@@ -9,6 +9,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 from rich.text import Span, Text
 
+from joy.theme import t
 from joy.tools import Change
 
 COLLAPSED_LINES = 20
@@ -17,11 +18,6 @@ NO_EOL = "\x00"
 NO_EOL_NOTE = "  ⏎ no newline at end of file"
 CONTEXT_LINES = 3
 HIGHLIGHT_LIMIT = 200_000
-PANEL_BACKGROUND = "#1a1a1a"
-BORDER = "#3a3a3a"
-ROW_STYLES = {"+": "on #12353a", "-": "on #3b1b21", " ": ""}
-SIGN_STYLES = {"+": "bold #4ade80", "-": "bold #f87171", " ": ""}
-NUMBER_STYLES = {"+": "#9ca3af", "-": "#9ca3af", " ": "#5b6270"}
 GAP = "⋯"
 LABELS = {"created": "Created", "modified": "Modified"}
 
@@ -217,12 +213,15 @@ def merge_changes(changes: list[Change]) -> list[Change]:
 
 
 def render_change(change: Change, number: int, limit: int | None = COLLAPSED_LINES) -> tuple[Panel, int]:
+    row_styles = {"+": t.add_row, "-": t.remove_row, " ": ""}
+    sign_styles = {"+": t.add_sign, "-": t.remove_sign, " ": ""}
+    number_styles = {"+": t.gutter, "-": t.gutter, " ": t.faint}
     rows = _rows(change)
     added = sum(1 for _, sign, _ in rows if sign == "+")
     removed = sum(1 for _, sign, _ in rows if sign == "-")
     title = Text.assemble(
-        (f"{LABELS[change.kind]} ", "bold"), (change.path, "cyan"),
-        (f"  +{added}", "green"), *([(f" −{removed}", "red")] if removed else []),
+        (f"{LABELS[change.kind]} ", "bold"), (change.path, t.info),
+        (f"  +{added}", t.success), *([(f" −{removed}", t.danger)] if removed else []),
     )
     shown = rows if limit is None else rows[:limit]
     hidden = len(rows) - len(shown)
@@ -254,13 +253,13 @@ def render_change(change: Change, number: int, limit: int | None = COLLAPSED_LIN
                 code.append(NO_EOL_NOTE, style="dim italic")
             code.overflow = "fold"
             body.add_row(
-                Text(str(line_number), style=NUMBER_STYLES[sign]),
-                Text(sign if sign != " " else "", style=SIGN_STYLES[sign]),
+                Text(str(line_number), style=number_styles[sign]),
+                Text(sign if sign != " " else "", style=sign_styles[sign]),
                 code,
-                style=ROW_STYLES[sign],
+                style=row_styles[sign],
             )
     panel = Panel(
         body, title=title, title_align="left", subtitle=subtitle, subtitle_align="left",
-        box=box.ROUNDED, border_style=BORDER, style=f"on {PANEL_BACKGROUND}", padding=(0, 0),
+        box=box.ROUNDED, border_style=t.border, style=t.panel, padding=(0, 0),
     )
     return panel, hidden

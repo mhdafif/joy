@@ -1,3 +1,5 @@
+"""Shared helpers for driving the full-screen app without a terminal."""
+
 import asyncio
 import os
 import tempfile
@@ -12,11 +14,8 @@ from prompt_toolkit.output import DummyOutput
 
 from joy.cli import main
 from joy.llm import MODEL
+from joy.theme import DEFAULT_PALETTE, use
 from joy.transcript import Transcript
-"""Shared helpers for driving the full-screen app without a terminal."""
-
-
-
 
 FOOTER = MODEL.split(":", 1)[1] + " | "
 UP, DOWN, ESCAPE, ENTER = "\x1b[A", "\x1b[B", "\x1b", "\r"
@@ -72,6 +71,7 @@ class CliCase(unittest.TestCase):
         previous = os.getcwd()
         os.chdir(self.workspace.name)
         self.addCleanup(os.chdir, previous)
+        self.addCleanup(use, DEFAULT_PALETTE)
 
     def run_main(self, driver, reply=None, argv=(), patches=()):
         transcripts = []

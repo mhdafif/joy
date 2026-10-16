@@ -4,6 +4,8 @@ from rich.console import Console, ConsoleOptions, RenderableType, RenderResult
 from rich.padding import Padding
 from rich.text import Text
 
+from joy.theme import t
+
 TOOL_GLYPHS = {"read": ("→", "Read"), "write": ("←", "Write"), "edit": ("←", "Edit"), "bash": ("$", "")}
 VERBS = {"read": "read", "write": "wrote", "edit": "edited"}
 
@@ -12,12 +14,12 @@ def render_tool(step: dict, indent: int = 1) -> RenderableType:
     glyph, label = TOOL_GLYPHS.get(step["name"], ("◆", step["name"]))
     failed = step.get("status") == "failed"
     line = Text()
-    line.append(("✗" if failed else glyph) + " ", style="red" if failed else "cyan")
+    line.append(("✗" if failed else glyph) + " ", style=t.danger if failed else t.info)
     if label:
         line.append(label + " ", style="bold")
     line.append(step.get("detail", ""))
     if failed and step.get("error"):
-        line.append(" — " + step["error"], style="red")
+        line.append(" — " + step["error"], style=t.danger)
     return Padding(line, (0, 0, 0, indent))
 
 
@@ -50,11 +52,11 @@ class StepGroup:
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
         line = Text(" ")
-        line.append("▾ " if self.expanded else "▸ ", style="cyan")
+        line.append("▾ " if self.expanded else "▸ ", style=t.info)
         line.append(summarize(self.steps))
         failed = sum(1 for step in self.steps if step.get("status") == "failed")
         if failed:
-            line.append(f" · {failed} failed", style="red")
+            line.append(f" · {failed} failed", style=t.danger)
         if not self.expanded:
             line.append("  ctrl+o to expand", style="dim")
         yield line

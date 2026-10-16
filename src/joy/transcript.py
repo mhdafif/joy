@@ -11,6 +11,8 @@ from prompt_toolkit.layout.controls import UIContent, UIControl
 from prompt_toolkit.mouse_events import MouseEvent, MouseEventType
 from rich.console import Console, RenderableType
 
+from joy.markdown import markdown_theme
+
 LINK = re.compile(r"\x1b\]8;[^\x1b]*\x1b\\")
 WHEEL_STEP = 3
 MIN_WIDTH = 20
@@ -21,7 +23,7 @@ Line = StyleAndTextTuples
 def render_lines(renderable: RenderableType, width: int) -> list[Line]:
     console = Console(
         file=StringIO(), force_terminal=True, color_system="truecolor", no_color=False,
-        width=max(width, MIN_WIDTH), legacy_windows=False,
+        width=max(width, MIN_WIDTH), legacy_windows=False, theme=markdown_theme(),
     )
     console.print(renderable)
     text = LINK.sub("", console.file.getvalue())
