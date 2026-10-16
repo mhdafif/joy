@@ -27,6 +27,20 @@ class StepsTest(unittest.TestCase):
         self.assertEqual(summarize(steps), 'Read a.py, edited a.py and ran 2 commands')
         self.assertEqual(summarize([{'name': 'mystery'}, {'name': 'other'}]), 'Used 2 other tools')
 
+    def test_one_step_is_a_plain_line_and_several_fold_into_an_accordion(self):
+        one = StepGroup(False, [{'name': 'read', 'detail': 'a.py'}])
+        self.assertEqual(render_plain(one).strip(), '→ Read a.py')
+        many = StepGroup(False, [{'name': 'read', 'detail': 'a.py'}, {'name': 'bash', 'detail': 'ls'}])
+        folded = render_plain(many)
+        self.assertIn('▸ Read a.py and ran 1 command', folded)
+        self.assertIn('ctrl+o to expand', folded)
+        self.assertNotIn('→ Read a.py', folded)
+        many.expanded = True
+        opened = render_plain(many)
+        self.assertIn('▾ Read a.py and ran 1 command', opened)
+        self.assertIn('→ Read a.py', opened)
+        self.assertIn('$ ls', opened)
+
     def test_failed_steps_are_counted_and_explained(self):
         group = StepGroup(True, [
             {'name': 'bash', 'detail': 'false', 'status': 'failed', 'error': 'declined'},

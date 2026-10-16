@@ -51,6 +51,9 @@ class StepGroup:
         self.steps = list(steps or [])
 
     def __rich_console__(self, console: Console, options: ConsoleOptions) -> RenderResult:
+        if len(self.steps) == 1:
+            yield render_tool(self.steps[0])
+            return
         line = Text(" ")
         line.append("▾ " if self.expanded else "▸ ", style=t.info)
         line.append(summarize(self.steps))

@@ -85,7 +85,7 @@ Joy opens on its own full-screen page, like vim or OpenCode, and your terminal i
 
 Joy captures the mouse for scrolling, so to select and copy text hold **Option** (Mac Terminal, iTerm2) or **Shift** (most other terminals) while dragging.
 
-Every step Joy takes is printed in the conversation as it happens, for example `→ Read a.txt`, `← Edit a.txt`, `← Write b.txt`, and `$ npm test`; a failed step is marked with a red `✗` and the reason. Once the reply finishes, each run of steps folds into one readable line such as `▸ Read a.txt, edited a.txt and ran 1 command`; open it with Ctrl+O or a click to see every step. When the answer is complete, a dim line under it shows the model, the time worked, and the tokens used, such as `gpt-5.6-luna | 12s | 4.9k tokens` (tokens are summed over every request the reply needed, and are left out if the endpoint does not report usage).
+Every step Joy takes is printed in the conversation as it happens, for example `→ Read a.txt`, `← Edit a.txt`, `← Write b.txt`, and `$ npm test`; a failed step is marked with a red `✗` and the reason. Once the reply finishes, each run of steps folds into one readable line such as `▸ Read a.txt, edited a.txt and ran 1 command`; open it with Ctrl+O or a click to see every step. A run with a single step is shown as that one line instead of a folded group. When the answer is complete, a dim line under it shows the model, the time worked, and the tokens used, such as `gpt-5.6-luna | 12s | 4.9k tokens` (tokens are summed over every request the reply needed, and are left out if the endpoint does not report usage).
 
 Every file change from `write` or `edit` is shown as a colored diff once the reply
 finishes. Changes made through `bash` are shown too when the command names the file
