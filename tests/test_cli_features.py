@@ -11,8 +11,9 @@ from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from harness import DOWN, ESCAPE, FOOTER, UP, CliCase, Replies, last_user_text, settle, wait_for
 from joy.llm import Approval, Decision, ToolEvent
 from joy.settings import load_settings
-from joy.sessions import list_sessions
+from joy.sessions import list_sessions, new_session, save_session
 from joy.theme import active
+from joy.tools import Change
 from joy.transcript import Transcript
 """Feature behavior of the full-screen app: queue, modes, approvals, undo, compact, and more."""
 
@@ -498,6 +499,119 @@ class ApprovalTest(CliCase):
 
         self.run_main(driver, replies)
         self.assertEqual(outcomes, [("rm -rf build", False), ("touch b", True), ("touch c", False)])
+
+
+class UndoTest(CliCase):
+    def two_file_turns(self):
+        async def write(call, content, kind, before):
+            Path("n.txt").write_text(content)
+            yield Change("n.txt", kind, before, content)
+            yield "done"
+
+        async def first(call):
+            async for chunk in write(call, "v1\n", "created", ""):
+                yield chunk
+
+        async def second(call):
+            async for chunk in write(call, "v2\n", "modified", "v1\n"):
+                yield chunk
+
+        return Replies(first, second)
+
+    async def two_turns(self, pipe, transcript):
+        await say(pipe, "make n")
+        await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+        await say(pipe, "change n")
+        await wait_for(lambda: transcript.plain().count(FOOTER) == 2)
+
+    def test_the_task_window_can_copy_a_message(self):
+        copied = []
+        replies = self.two_file_turns()
+
+        async def driver(app, pipe, transcript):
+            await self.two_turns(pipe, transcript)
+            await say(pipe, "/undo")
+            await settle(0.25)
+            pipe.send_text("\r")
+            await wait_for(lambda: "Copied to the clipboard." in transcript.plain())
+
+        with patch("joy.cli.copy_text", side_effect=lambda text: copied.append(text) or True):
+            self.run_main(driver, replies)
+        self.assertEqual(copied, ["change n"])
+
+    def test_undo_restores_files_rewinds_the_chat_and_refills_the_input(self):
+        replies = self.two_file_turns()
+
+        async def driver(app, pipe, transcript):
+            await self.two_turns(pipe, transcript)
+            await say(pipe, "/undo")
+            await settle(0.25)
+            pipe.send_text(DOWN + "\r")
+            await wait_for(lambda: "Undid the task" in transcript.plain())
+            self.assertEqual(Path("n.txt").read_text(), "v1\n")
+            self.assertNotIn("› change n", transcript.plain())
+            self.assertIn("› make n", transcript.plain())
+            await wait_for(lambda: app.current_buffer.text == "change n")
+            app.current_buffer.reset()
+            await say(pipe, "retry")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 2)
+            await say(pipe, "/undo")
+            await settle(0.25)
+            pipe.send_text(DOWN + "\r")
+            await wait_for(lambda: app.current_buffer.text == "retry")
+
+        self.run_main(driver, replies)
+        self.assertEqual([m["role"] for m in replies.calls[2]["messages"]], ["system", "user", "assistant", "user"])
+        self.assertEqual(replies.calls[2]["messages"][-1]["content"], "retry")
+
+    def test_undoing_the_first_task_removes_the_file_and_the_empty_session(self):
+        replies = self.two_file_turns()
+
+        async def driver(app, pipe, transcript):
+            await self.two_turns(pipe, transcript)
+            await say(pipe, "/undo")
+            await settle(0.25)
+            pipe.send_text(DOWN + "\r")
+            await wait_for(lambda: "Undid the task" in transcript.plain())
+            await wait_for(lambda: app.current_buffer.text == "change n")
+            app.current_buffer.reset()
+            await say(pipe, "/undo")
+            await settle(0.25)
+            pipe.send_text(DOWN + "\r")
+            await wait_for(lambda: not Path("n.txt").exists())
+            await wait_for(lambda: app.current_buffer.text == "make n")
+
+        self.run_main(driver, replies)
+        self.assertEqual(list_sessions(str(Path.cwd().resolve())), [])
+
+    def test_files_you_changed_afterwards_are_left_alone(self):
+        replies = self.two_file_turns()
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "make n")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            Path("n.txt").write_text("my own edit\n")
+            await say(pipe, "/undo")
+            await settle(0.25)
+            pipe.send_text(DOWN + "\r")
+            await wait_for(lambda: "Left alone because they changed afterwards: n.txt" in transcript.plain())
+            self.assertEqual(Path("n.txt").read_text(), "my own edit\n")
+
+        self.run_main(driver, replies)
+
+    def test_messages_from_older_sessions_cannot_be_undone(self):
+        session = new_session(str(Path.cwd().resolve()), "old task")
+        session.events = [{"t": "user", "text": "old task"}, {"t": "text", "text": "old answer"}]
+        session.messages = [{"role": "user", "content": "old task"}, {"role": "assistant", "content": "old answer"}]
+        save_session(session)
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "/undo")
+            await settle(0.25)
+            pipe.send_text(DOWN + "\r")
+            await wait_for(lambda: "cannot be undone" in transcript.plain())
+
+        self.run_main(driver, Replies(), argv=["-c"])
 
 
 class ConnectionsAndSettingsTest(CliCase):

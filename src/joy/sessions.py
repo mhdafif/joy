@@ -68,3 +68,7 @@ def list_sessions(folder: str) -> list[Session]:
 def latest_session(folder: str) -> Session | None:
     found = list_sessions(folder)
     return found[0] if found else None
+
+
+def delete_session(session: Session) -> None:
+    (sessions_dir() / f"{session.id}.json").unlink(missing_ok=True)

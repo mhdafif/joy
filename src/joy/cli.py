@@ -52,10 +52,11 @@ from joy.llm import DEFAULT_MODEL, Approval, ToolEvent, Usage, list_models, stre
 from joy.settings import load_settings, save_settings
 from joy.skills import discover as discover_skills
 from joy.theme import PALETTES, active, t, use
-from joy.sessions import Session, latest_session, list_sessions, new_session, save_session
+from joy.sessions import Session, delete_session, latest_session, list_sessions, new_session, save_session
 from joy.steps import StepGroup
 from joy.tools import Change
 from joy.transcript import Block, Transcript
+from joy.undo import revert_change
 
 INPUT_MAX_ROWS = 10
 PICKER_ROWS = 8
@@ -88,6 +89,7 @@ LOGO = (
 )
 COMMANDS = dict(sorted({
     "/expand": "show a full diff",
+    "/undo": "undo a task: revert its file changes and rewind the chat",
     "/build": "build mode: Joy can change files",
     "/plan": "plan mode: Joy only investigates and proposes a plan",
     "/session": "switch to another session",
@@ -824,16 +826,73 @@ def main(argv: list[str] | None = None) -> None:
             PickerItem(session.name, format_date(session.updated), session) for session in found
         ], pick_session, hint=[(t.strong, "Enter"), (t.muted, " to open")])
 
+    def undo_info(event: dict) -> tuple[int, int] | None:
+        if current is None or "base" not in event:
+            return None
+        index = next((i for i, earlier in enumerate(current.events) if earlier is event), None)
+        if index is None:
+            return None
+        last_compact = max((i for i, earlier in enumerate(current.events) if earlier["t"] == "compact"), default=-1)
+        if index < last_compact:
+            return None
+        files = {item["path"] for later in current.events[index:] if later["t"] == "changes" for item in later["items"]}
+        return index, len(files)
+
+    def perform_undo(event: dict) -> None:
+        nonlocal current
+        info = undo_info(event)
+        if info is None or current is None:
+            emit(Text("This message cannot be undone.", style="dim"))
+            emit()
+            return
+        index, _ = info
+        reverted: set[str] = set()
+        skipped: list[str] = []
+        for later in reversed(current.events[index:]):
+            if later["t"] != "changes":
+                continue
+            for item in reversed(later["items"]):
+                if revert_change(Path(workspace), item):
+                    reverted.add(item["path"])
+                else:
+                    skipped.append(item["path"])
+        text, base = event["text"], event["base"]
+        current.events = current.events[:index]
+        current.messages = current.messages[:base]
+        if current.events:
+            current.updated = time.time()
+            save_session(current)
+            load_session(current)
+        else:
+            delete_session(current)
+            start_new_session()
+        buffer.text = text
+        buffer.cursor_position = len(text)
+        emit(Text(f"Undid the task: {len(reverted)} file{'' if len(reverted) == 1 else 's'} restored and the conversation rewound. The message is back in the input if you want to edit and resend it.", style="dim"))
+        if skipped:
+            emit(Text("Left alone because they changed afterwards: " + ", ".join(dict.fromkeys(skipped)), style=t.danger))
+        emit()
+
     def run_task_action(action: str, block: Block | None, event: dict) -> None:
-        copy_message(block, event["text"])
+        if action == "copy":
+            copy_message(block, event["text"])
+        else:
+            perform_undo(event)
 
     def open_task_modal(block: Block | None, event: dict) -> None:
         if waiting:
             emit(Text("Wait for the reply to finish, or press Esc to stop it.", style="dim"))
             emit()
             return
+        info = undo_info(event)
+        if info is None:
+            detail = "not available for this message"
+        elif info[1]:
+            detail = f"revert {info[1]} file{'s' if info[1] != 1 else ''} and rewind the chat"
+        else:
+            detail = "rewind the chat"
         open_picker(
-            "Task", [PickerItem("Copy message", "", "copy")],
+            "Task", [PickerItem("Copy message", "", "copy"), PickerItem("Undo", detail, "undo")],
             lambda item: run_task_action(str(item.value), block, event), searchable=False, subtitle=event["text"],
             hint=[(t.strong, "Enter"), (t.muted, " to choose · Esc closes")],
         )
@@ -1159,7 +1218,7 @@ def main(argv: list[str] | None = None) -> None:
             names = ", ".join(f'"{name}"' for name in used)
             sent = f"Use the {names} skill{'s' if len(used) > 1 else ''} for this request (load with the skill tool first).\n\n{message}"
         content, attached = expand_mentions(Path(workspace), sent)
-        record({"t": "user", "text": display or message, "attached": attached})
+        record({"t": "user", "text": display or message, "attached": attached, "base": len(history) - 1})
         waiting = True
         started = time.monotonic()
         answer = ""
@@ -1223,6 +1282,14 @@ def main(argv: list[str] | None = None) -> None:
             return
         if message == "/connect":
             open_connect()
+            return
+        if message == "/undo":
+            last = next((e for e in reversed(current.events) if e["t"] == "user"), None) if current else None
+            if last is None:
+                emit(Text("There is nothing to undo yet.", style="dim"))
+                emit()
+            else:
+                open_task_modal(None, last)
             return
         command, _, argument = message.partition(" ")
         if command == "/expand":

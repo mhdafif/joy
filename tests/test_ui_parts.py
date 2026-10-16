@@ -1,3 +1,5 @@
+"""Steps, theme, markdown, transcript interaction, and clipboard helpers."""
+
 import base64
 import re
 import unittest
@@ -15,7 +17,6 @@ from joy.cli import ReferenceProcessor, format_date, format_elapsed, format_toke
 from joy.markdown import JoyMarkdown
 from joy.steps import StepGroup, summarize
 from joy.transcript import Transcript, render_lines
-"""Steps, theme, markdown, transcript interaction, and clipboard helpers."""
 
 
 def render_plain(renderable, width=60):
@@ -196,6 +197,7 @@ class SmallHelpersTest(unittest.TestCase):
     def test_command_matching_is_alphabetical_and_ignores_arguments(self):
         names = matching_commands('/')
         self.assertEqual(names, sorted(names))
+        self.assertIn('/undo', names)
         self.assertEqual(matching_commands('/mo'), ['/model'])
         self.assertEqual(matching_commands('/model now'), [])
         self.assertEqual(matching_commands('hello'), [])
