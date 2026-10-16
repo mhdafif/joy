@@ -68,6 +68,7 @@ Without the script, set these in your shell; `.env` files are not loaded automat
 Joy opens on its own full-screen page, like vim or OpenCode, and your terminal is restored when you exit. The conversation, diffs, and input all live on that page.
 
 - **Tab** — switch between **Build** and **Plan** mode (also `/build` and `/plan`); the current mode is shown on the input box. In **Plan** mode Joy only investigates: it can use `read` and a read-only `bash`, and answers with a plan instead of changing anything. If you ask it to actually change something ("create a file", "fix the bug"), it says in one short sentence that Plan mode is read-only and to press Tab for Build, instead of drafting a plan. When a Plan answer comes after Joy looked at your files or ran a command, it ends with an italic *Plan mode: no files changed.* line (unless the answer already says so); a plain chat answer such as "hi" does not. Switch back to Build and ask it to go ahead when you are happy with the plan; "apply the plan" applies the latest plan in the conversation.
+- **Click a message you sent** — opens a small window with **Copy message**. The message lightens and shows `click for options` while the pointer is over it.
 - **Page Up / Page Down** or the **mouse wheel** — scroll the conversation. New output keeps the view where it is while you read earlier messages; sending a message jumps back to the bottom.
 - **Alt+Enter** (**Option+Enter** on Mac) or **Ctrl+J** — insert a newline. Option+Enter needs your terminal to send Option as Meta (VS Code: `terminal.integrated.macOptionIsMeta`); Ctrl+J works everywhere.
 - **Ctrl+C** — cancel input or the pending reply.
@@ -102,6 +103,8 @@ Every conversation is saved automatically to `~/.joy/sessions` (set `JOY_HOME` t
 You can draft your next message while a reply streams. Conversation history lasts
 until you exit. Cancelling stops further tool calls; completed file changes remain.
 The API request may still finish in the background.
+
+While any window is open, the screen behind it is dimmed.
 
 File tools operate inside the directory where you launch Joy. Bash runs with your
 user permissions and a default 30-second timeout; it is not sandboxed. In Plan mode bash is limited to an allowlist of read-only commands (`ls`, `cat`, `grep`, `rg`, `find`, `tree`, `git status/log/diff/show`, and similar) that stay inside the workspace, with no redirects or command chaining; this is a safety net, not a sandbox.

@@ -1,10 +1,17 @@
+import base64
 import re
 import unittest
 from pathlib import Path
+from unittest.mock import patch
+
+from prompt_toolkit.data_structures import Point
 from prompt_toolkit.formatted_text import fragment_list_to_text
+from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 from rich.console import Console
-from joy import theme
-from joy.cli import format_date, format_elapsed, format_tokens
+from rich.text import Text
+
+from joy import clipboard, theme
+from joy.cli import format_date, format_elapsed, format_tokens, render_user
 from joy.markdown import JoyMarkdown
 from joy.steps import StepGroup, summarize
 from joy.transcript import Transcript, render_lines
@@ -16,6 +23,10 @@ def render_plain(renderable, width=60):
     with console.capture() as capture:
         console.print(renderable)
     return capture.get()
+
+
+def mouse(kind, row):
+    return MouseEvent(position=Point(x=3, y=row), event_type=kind, button=MouseButton.LEFT, modifiers=frozenset())
 
 
 class StepsTest(unittest.TestCase):
@@ -119,9 +130,49 @@ class MarkdownTest(unittest.TestCase):
 
 
 class TranscriptInteractionTest(unittest.TestCase):
+    def build(self):
+        transcript = Transcript()
+        clicked = []
+        transcript.add('plain first line')
+        block = transcript.add(
+            'message', on_click=lambda block: clicked.append(block),
+            renderer=lambda state: Text(f'message [{state}]'),
+        )
+        transcript.add('plain last line')
+        transcript.create_content(40, 10)
+        return transcript, block, clicked
 
+    def test_hover_marks_only_blocks_that_can_react_and_unmarks_on_leaving(self):
+        transcript, block, _ = self.build()
+        self.assertEqual(block.state, 'idle')
+        transcript.mouse_handler(mouse(MouseEventType.MOUSE_MOVE, 1))
+        self.assertEqual(block.state, 'hover')
+        self.assertIn('[hover]', transcript.plain(40))
+        transcript.mouse_handler(mouse(MouseEventType.MOUSE_MOVE, 0))
+        self.assertEqual(block.state, 'idle')
+        transcript.mouse_handler(mouse(MouseEventType.MOUSE_MOVE, 1))
+        transcript.mouse_handler(mouse(MouseEventType.MOUSE_MOVE, 99))
+        self.assertEqual(block.state, 'idle')
 
+    def test_click_runs_the_blocks_action_but_only_on_that_block(self):
+        transcript, block, clicked = self.build()
+        transcript.mouse_handler(mouse(MouseEventType.MOUSE_UP, 0))
+        self.assertEqual(clicked, [])
+        transcript.mouse_handler(mouse(MouseEventType.MOUSE_UP, 1))
+        self.assertEqual(clicked, [block])
 
+    def test_wheel_scrolls_and_clear_resets_everything(self):
+        transcript = Transcript()
+        for number in range(30):
+            transcript.add(f'line {number}')
+        transcript.create_content(40, 10)
+        transcript.mouse_handler(mouse(MouseEventType.SCROLL_UP, 0))
+        self.assertEqual(transcript.scroll_back, 3)
+        transcript.mouse_handler(mouse(MouseEventType.SCROLL_DOWN, 0))
+        self.assertEqual(transcript.scroll_back, 0)
+        transcript.scroll(5)
+        transcript.clear()
+        self.assertEqual((transcript.blocks, transcript.scroll_back, transcript.hovered), ([], 0, None))
 
     def test_refreshing_a_block_redraws_it_and_live_content_is_shown_last(self):
         transcript = Transcript()
@@ -140,3 +191,32 @@ class SmallHelpersTest(unittest.TestCase):
         self.assertEqual((format_elapsed(5), format_elapsed(65), format_elapsed(600)), ('5s', '1m 05s', '10m 00s'))
         self.assertEqual((format_tokens(842), format_tokens(12_345)), ('842 tokens', '12.3k tokens'))
         self.assertRegex(format_date(1_700_000_000), r'^\w{3} \d{2}( \d{4}|, \d{2}:\d{2})$')
+
+    def test_your_messages_show_a_hint_when_hovered_or_copied(self):
+        self.assertNotIn('click', render_plain(render_user('hi', 'idle')))
+        self.assertIn('click for options', render_plain(render_user('hi', 'hover')))
+        self.assertIn('copied ✓', render_plain(render_user('hi', 'copied')))
+        self.assertIn('copy failed', render_plain(render_user('hi', 'failed')))
+
+
+class ClipboardTest(unittest.TestCase):
+    def test_uses_the_first_tool_that_works(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append((command[0], kwargs['input']))
+            if command[0] == 'wl-copy':
+                raise OSError('broken')
+
+        with patch.object(clipboard.sys, 'platform', 'linux'), \
+                patch('joy.clipboard.shutil.which', side_effect=lambda name: name if name != 'xclip' else None), \
+                patch('joy.clipboard.subprocess.run', side_effect=fake_run):
+            self.assertTrue(clipboard.copy_text('héllo'))
+        self.assertEqual(calls, [('wl-copy', 'héllo'.encode()), ('xsel', 'héllo'.encode())])
+
+    def test_reports_failure_when_nothing_is_available_and_encodes_for_the_terminal(self):
+        with patch('joy.clipboard.shutil.which', return_value=None):
+            self.assertFalse(clipboard.copy_text('x'))
+        sequence = clipboard.osc52('hello')
+        self.assertTrue(sequence.startswith('\x1b]52;c;') and sequence.endswith('\x07'))
+        self.assertEqual(base64.b64decode(sequence[7:-1]), b'hello')

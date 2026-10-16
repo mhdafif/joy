@@ -34,15 +34,22 @@ def render_lines(renderable: RenderableType, width: int) -> list[Line]:
 
 
 class Block:
-    def __init__(self, renderable: RenderableType, on_click: Callable[["Block"], None] | None = None) -> None:
+    def __init__(
+        self, renderable: RenderableType, on_click: Callable[["Block"], None] | None = None,
+        renderer: Callable[[str], RenderableType] | None = None,
+        hit: Callable[["Block", int, int], bool] | None = None,
+    ) -> None:
         self.renderable = renderable
         self.on_click = on_click
+        self.renderer = renderer
+        self.hit = hit
+        self.state = "idle"
         self.width = 0
         self.lines: list[Line] = []
 
     def get(self, width: int) -> list[Line]:
         if width != self.width:
-            self.lines = render_lines(self.renderable, width)
+            self.lines = render_lines(self.renderer(self.state) if self.renderer else self.renderable, width)
             self.width = width
         return self.lines
 
@@ -53,15 +60,22 @@ class Transcript(UIControl):
         self.version = 0
         self.live_block: Block | None = None
         self.owners: list[Block | None] = []
+        self.rows: list[int] = []
         self.visible: list[Block | None] = []
+        self.visible_rows: list[int] = []
+        self.hovered: Block | None = None
         self.scroll_back = 0
         self.height = 24
         self.total = 0
         self.joined_key: tuple[int, int] | None = None
         self.joined: list[Line] = []
 
-    def add(self, renderable: RenderableType, on_click: Callable[[Block], None] | None = None) -> Block:
-        block = Block(renderable, on_click)
+    def add(
+        self, renderable: RenderableType, on_click: Callable[[Block], None] | None = None,
+        renderer: Callable[[str], RenderableType] | None = None,
+        hit: Callable[["Block", int, int], bool] | None = None,
+    ) -> Block:
+        block = Block(renderable, on_click, renderer, hit)
         self.blocks.append(block)
         self.version += 1
         return block
@@ -78,7 +92,21 @@ class Transcript(UIControl):
         self.joined_key = None
         self.joined = []
         self.owners = []
+        self.rows = []
         self.visible = []
+        self.visible_rows = []
+        self.hovered = None
+
+    def set_hover(self, block: Block | None) -> None:
+        if block is self.hovered:
+            return
+        previous, self.hovered = self.hovered, block
+        if previous is not None and previous.state == "hover":
+            previous.state = "idle"
+            self.refresh(previous)
+        if block is not None and block.state == "idle":
+            block.state = "hover"
+            self.refresh(block)
 
     def set_live(self, renderable: RenderableType | None) -> None:
         self.live_block = None if renderable is None else Block(renderable)
@@ -89,11 +117,13 @@ class Transcript(UIControl):
         if key != self.joined_key:
             joined: list[Line] = []
             owners: list[Block | None] = []
+            rows: list[int] = []
             for block in [*self.blocks, *([self.live_block] if self.live_block is not None else [])]:
                 block_lines = block.get(width)
                 joined.extend(block_lines)
                 owners.extend([block] * len(block_lines))
-            self.joined, self.owners, self.joined_key = joined, owners, key
+                rows.extend(range(len(block_lines)))
+            self.joined, self.owners, self.rows, self.joined_key = joined, owners, rows, key
         return self.joined
 
     def plain(self, width: int = 80) -> str:
@@ -123,19 +153,33 @@ class Transcript(UIControl):
         start = max(0, end - height)
         visible = lines[start:end]
         self.visible = self.owners[start:end]
+        self.visible_rows = self.rows[start:end]
         return UIContent(
             get_line=lambda index: visible[index] if index < len(visible) else [],
             line_count=len(visible), show_cursor=False,
         )
+
+    def target(self, mouse_event: MouseEvent) -> Block | None:
+        row = mouse_event.position.y
+        if not 0 <= row < len(self.visible):
+            return None
+        block = self.visible[row]
+        if block is not None and block.hit is not None and not block.hit(
+            block, self.visible_rows[row], mouse_event.position.x,
+        ):
+            return None
+        return block
 
     def mouse_handler(self, mouse_event: MouseEvent):
         if mouse_event.event_type == MouseEventType.SCROLL_UP:
             self.scroll(WHEEL_STEP)
         elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
             self.scroll(-WHEEL_STEP)
+        elif mouse_event.event_type == MouseEventType.MOUSE_MOVE:
+            block = self.target(mouse_event)
+            self.set_hover(block if block is not None and block.renderer is not None else None)
         elif mouse_event.event_type == MouseEventType.MOUSE_UP:
-            row = mouse_event.position.y
-            block = self.visible[row] if 0 <= row < len(self.visible) else None
+            block = self.target(mouse_event)
             if block is None or block.on_click is None:
                 return NotImplemented
             block.on_click(block)

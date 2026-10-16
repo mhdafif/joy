@@ -5,6 +5,7 @@ import asyncio
 import os
 import re
 import sys
+import textwrap
 import time
 from collections.abc import Callable
 from contextlib import aclosing
@@ -32,11 +33,13 @@ from prompt_toolkit.utils import get_cwidth
 from prompt_toolkit.widgets import Box
 from rich.console import Console, Group, RenderableType
 from rich.padding import Padding
+from rich.table import Table
 from rich.text import Text
 
 from joy.connections import (
     RECENT_LIMIT, Connection, load_connections, load_recent, load_selection, save_connection, save_selection,
 )
+from joy.clipboard import copy_text, osc52
 from joy.diffview import COLLAPSED_LINES, merge_changes, render_change
 from joy.markdown import JoyMarkdown
 from joy.llm import DEFAULT_MODEL, ToolEvent, Usage, list_models, stream_reply
@@ -116,6 +119,19 @@ def format_date(timestamp: float) -> str:
 
 def render_answer(text: str) -> RenderableType:
     return Padding(JoyMarkdown(text.lstrip()), (0, 0, 0, 1))
+
+
+def render_user(text: str, state: str = "idle") -> RenderableType:
+    body = Text("› " + text.replace("\n", "\n  "))
+    if state == "idle":
+        return Padding(body, (1, 1), style=t.message)
+    labels = {"hover": ("click for options", "dim"), "copied": ("copied ✓", t.success), "failed": ("copy failed", t.danger)}
+    label, style = labels[state]
+    grid = Table.grid(expand=True)
+    grid.add_column(ratio=1)
+    grid.add_column(no_wrap=True, justify="right")
+    grid.add_row(body, Text(label + " ", style=style))
+    return Padding(grid, (1, 1), style=t.message_hover)
 
 
 def render_parts(parts: list[dict]) -> RenderableType:
@@ -199,6 +215,8 @@ def main(argv: list[str] | None = None) -> None:
     picker_choose: Callable[[PickerItem], None] | None = None
     picker_custom: Callable[[str], PickerItem] | None = None
     picker_id = 0
+    picker_subtitle = ""
+    picker_searchable = True
     forming = False
     form_index = 0
     form_values: list[str] = []
@@ -242,7 +260,7 @@ def main(argv: list[str] | None = None) -> None:
     def visible_items() -> list[PickerItem]:
         if not picking:
             return []
-        query = modal_buffer.text.strip().lower()
+        query = modal_buffer.text.strip().lower() if picker_searchable else ""
         items = [item for item in picker_items if query in item.label.lower()]
         if picker_custom is not None and query and not any(item.label.lower() == query for item in picker_items):
             items.append(picker_custom(modal_buffer.text.strip()))
@@ -286,7 +304,7 @@ def main(argv: list[str] | None = None) -> None:
     def picker_rows() -> list[list[tuple[str, str]]]:
         items = visible_items()
         width = modal_width() - 4
-        searching = bool(modal_buffer.text.strip())
+        searching = bool(modal_buffer.text.strip()) and picker_searchable
         limit = max(4, min(picker_limit, get_app().output.get_size().rows - 14))
         current_index = min(picked, len(items) - 1)
         entries: list[tuple[str, int, str]] = []
@@ -365,10 +383,35 @@ def main(argv: list[str] | None = None) -> None:
             fragments.append((t.subtle, f" {source}"))
         return [*fragments, ("", " ")]
 
-    def emit(renderable: RenderableType | None = None, on_click: Callable[[Block], None] | None = None) -> Block:
-        block = transcript.add(Text("") if renderable is None else renderable, on_click)
+    def emit(
+        renderable: RenderableType | None = None, on_click: Callable[[Block], None] | None = None,
+        renderer: Callable[[str], RenderableType] | None = None,
+    ) -> Block:
+        block = transcript.add(Text("") if renderable is None else renderable, on_click, renderer)
         get_app().invalidate()
         return block
+
+    async def reset_copy(block: Block) -> None:
+        await asyncio.sleep(1.5)
+        if block.state in ("copied", "failed"):
+            block.state = "hover" if transcript.hovered is block else "idle"
+            transcript.refresh(block)
+            get_app().invalidate()
+
+    def copy_message(block: Block | None, text: str) -> None:
+        copied = copy_text(text)
+        if not copied:
+            output = get_app().output
+            output.write_raw(osc52(text))
+            output.flush()
+            copied = True
+        if block is not None:
+            block.state = "copied" if copied else "failed"
+            transcript.refresh(block)
+            get_app().create_background_task(reset_copy(block))
+        else:
+            emit(Text("Copied to the clipboard.", style="dim"))
+            emit()
 
     def toggle_group(block: Block) -> None:
         block.renderable.expanded = not block.renderable.expanded
@@ -419,11 +462,11 @@ def main(argv: list[str] | None = None) -> None:
         last_group = None
         if kind == "user":
             emit()
-            emit(Padding(
-                Text("› " + event["text"].replace("\n", "\n  ")),
-                (1, 1),
-                style=t.message,
-            ))
+            text = event["text"]
+            emit(
+                render_user(text), lambda block, event=event: open_task_modal(block, event),
+                lambda state, text=text: render_user(text, state),
+            )
             emit()
         elif kind == "changes":
             for item in event["items"]:
@@ -513,10 +556,12 @@ def main(argv: list[str] | None = None) -> None:
         title: str, items: list[PickerItem], choose: Callable[[PickerItem], None],
         notes: dict[str, str] | None = None, custom: Callable[[str], PickerItem] | None = None,
         limit: int = PICKER_ROWS, order: list[str] | None = None,
-        hint: list[tuple[str, str]] | None = None,
+        hint: list[tuple[str, str]] | None = None, subtitle: str = "", searchable: bool = True,
     ) -> int:
         nonlocal picking, picked, picker_title, picker_items, picker_notes, picker_choose
         nonlocal picker_custom, picker_id, picker_limit, picker_order, picker_hint
+        nonlocal picker_subtitle, picker_searchable
+        picker_subtitle, picker_searchable = subtitle, searchable
         picking = True
         picked = 0
         picker_title, picker_items, picker_notes = title, items, dict(notes or {})
@@ -555,6 +600,20 @@ def main(argv: list[str] | None = None) -> None:
         open_picker("Sessions", [
             PickerItem(session.name, format_date(session.updated), session) for session in found
         ], pick_session, hint=[(t.strong, "Enter"), (t.muted, " to open")])
+
+    def run_task_action(action: str, block: Block | None, event: dict) -> None:
+        copy_message(block, event["text"])
+
+    def open_task_modal(block: Block | None, event: dict) -> None:
+        if waiting:
+            emit(Text("Wait for the reply to finish, or press Esc to stop it.", style="dim"))
+            emit()
+            return
+        open_picker(
+            "Task", [PickerItem("Copy message", "", "copy")],
+            lambda item: run_task_action(str(item.value), block, event), searchable=False, subtitle=event["text"],
+            hint=[(t.strong, "Enter"), (t.muted, " to choose · Esc closes")],
+        )
 
     def set_theme(item: PickerItem) -> None:
         use(str(item.value))
@@ -968,11 +1027,25 @@ def main(argv: list[str] | None = None) -> None:
         get_line_prefix=lambda line, wrap: "› " if line == 0 and wrap == 0 else "  ",
     )
 
-    def modal_input(placeholder: Callable[[], str], secret: Condition | None = None) -> Window:
+    def modal_input(
+        placeholder: Callable[[], str], secret: Condition | None = None, height: int | Callable[[], int] = 1,
+    ) -> Window:
         processors = [PlaceholderProcessor(placeholder)]
         if secret is not None:
             processors.insert(0, ConditionalProcessor(PasswordProcessor(), secret))
-        return Window(BufferControl(modal_buffer, input_processors=processors), height=1)
+        return Window(BufferControl(modal_buffer, input_processors=processors), height=height)
+
+    def subtitle_lines() -> list[str]:
+        if not picker_subtitle:
+            return []
+        width = max(modal_width() - 4, 20)
+        lines: list[str] = []
+        for raw in picker_subtitle.splitlines() or [""]:
+            lines += textwrap.wrap(raw, width) or [""]
+        return lines[:4] + (["…"] if len(lines) > 4 else [])
+
+    def search_height() -> int:
+        return 1 if picker_searchable else 0
 
     def blank() -> Window:
         return Window(height=1)
@@ -980,7 +1053,7 @@ def main(argv: list[str] | None = None) -> None:
     def text_window(render: Callable[[], StyleAndTextTuples], height: int | Callable[[], int] = 1) -> Window:
         return Window(FormattedTextControl(render), height=height)
 
-    picker_input = modal_input(lambda: "Search")
+    picker_input = modal_input(lambda: "Search", height=search_height)
     form_input = modal_input(
         lambda: CONNECT_STEPS[form_index][1],
         Condition(lambda: forming and CONNECT_STEPS[form_index][2]),
@@ -988,8 +1061,10 @@ def main(argv: list[str] | None = None) -> None:
     picker_modal = HSplit([
         text_window(lambda: title_row(picker_title)),
         blank(),
+        text_window(lambda: join_rows([[(t.text_soft, line)] for line in subtitle_lines()]), lambda: len(subtitle_lines())),
+        Window(height=lambda: 1 if subtitle_lines() else 0),
         picker_input,
-        blank(),
+        Window(height=search_height),
         text_window(lambda: join_rows(picker_rows()), lambda: max(len(picker_rows()), 1)),
         blank(),
         text_window(lambda: picker_hint),
@@ -1026,7 +1101,14 @@ def main(argv: list[str] | None = None) -> None:
             input_box,
             Window(FormattedTextControl(render_footer), height=1),
         ]),
-        floats=[modal_float(picker_modal, picking_open), modal_float(form_modal, forming_open)],
+        floats=[
+            Float(
+                content=ConditionalContainer(Window(style="dim"), filter=modal_open),
+                left=0, right=0, top=0, bottom=0, transparent=True,
+            ),
+            modal_float(picker_modal, picking_open),
+            modal_float(form_modal, forming_open),
+        ],
     )
     app: Application[None] = Application(
         layout=Layout(root, focused_element=input_window),
