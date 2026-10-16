@@ -151,3 +151,43 @@ class LlmTest(unittest.IsolatedAsyncioTestCase):
                 release.set()
                 while not finished.is_set():
                     await asyncio.sleep(0.01)
+
+    def tool_call(self, name, **arguments):
+        return {'type': 'function_call', 'id': 'fc_1', 'call_id': 'call_1', 'name': name,
+                'arguments': json.dumps(arguments), 'status': 'completed'}
+
+    def with_usage(self, event, total, prompt):
+        event['response']['usage'] = {
+            'input_tokens': prompt, 'output_tokens': total - prompt, 'total_tokens': total,
+            'input_tokens_details': {'cached_tokens': 0}, 'output_tokens_details': {'reasoning_tokens': 0},
+        }
+        return event
+
+    async def run_two_step_reply(self, first_output, **options):
+        payloads = []
+
+        def respond(request):
+            payloads.append(json.loads(request.content))
+            if len(payloads) == 1:
+                return sse([self.with_usage(completed(first_output), 120, 100)])
+            return sse([{'type': 'response.output_text.delta', 'delta': 'Done.'},
+                        self.with_usage(completed(), 50, 40)])
+
+        with tempfile.TemporaryDirectory() as directory:
+            with patch('joy.llm.Path.cwd', return_value=Path(directory)), self.client_patch(respond):
+                chunks = []
+                async for chunk in stream_reply([{'role': 'user', 'content': 'Go'}], **options):
+                    chunks.append(chunk)
+            return chunks, payloads, Path(directory)
+
+    async def test_long_commands_are_flattened_and_shortened_in_the_step_detail(self):
+        command = 'echo ' + 'x' * 300 + '\necho done'
+        chunks, _, _ = await self.run_two_step_reply([self.tool_call('bash', command=command)])
+        detail = next(c for c in chunks if isinstance(c, ToolEvent)).detail
+        self.assertNotIn('\n', detail)
+        self.assertEqual(len(detail), 200)
+        self.assertTrue(detail.endswith('…'))
+
+    async def test_plan_mode_offers_only_read_and_bash(self):
+        _, payloads, _ = await self.run_two_step_reply([self.tool_call('read', path='x')], readonly=True)
+        self.assertEqual([tool['name'] for tool in payloads[0]['tools']], ['read', 'bash'])

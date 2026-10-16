@@ -92,6 +92,7 @@ def list_models(connection: Connection | None = None) -> list[str]:
 
 async def stream_reply(
     messages: list[dict], model: str | None = None, connection: Connection | None = None,
+    readonly: bool = False,
 ) -> AsyncIterator[str | ToolEvent | Change | Usage]:
     model = model or DEFAULT_MODEL
     result: Queue[str | ToolEvent | Change | Usage | Exception | None] = Queue()
@@ -102,7 +103,7 @@ async def stream_reply(
         client = None
         try:
             client = OpenAI(timeout=60.0, max_retries=0, **(connection.client_options() if connection else {}))
-            toolbox = create_tools(workspace, cancelled, result.put)
+            toolbox = create_tools(workspace, cancelled, result.put, readonly)
             conversation = list(messages)
             for _ in range(16):
                 if cancelled.is_set():

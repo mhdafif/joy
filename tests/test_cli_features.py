@@ -1,6 +1,8 @@
+import re
 from pathlib import Path
 from unittest.mock import patch
 from harness import DOWN, FOOTER, CliCase, Replies, settle, wait_for
+from joy.llm import ToolEvent
 from joy.settings import load_settings
 from joy.sessions import list_sessions
 from joy.theme import active
@@ -13,13 +15,63 @@ async def say(pipe, text):
 
 
 class ModesAndContextTest(CliCase):
+    def test_tab_and_commands_switch_between_plan_and_build(self):
+        replies = Replies()
 
+        async def driver(app, pipe, transcript):
+            pipe.send_text("\t")
+            await wait_for(lambda: "Plan mode" in transcript.plain())
+            await say(pipe, "investigate")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            await say(pipe, "/build")
+            await wait_for(lambda: "Build mode" in transcript.plain())
+            await say(pipe, "implement")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 2)
+            await say(pipe, "/build")
+            await wait_for(lambda: "Already in build mode" in transcript.plain())
 
+        self.run_main(driver, replies)
+        plan, build = replies.calls
+        self.assertTrue(plan["readonly"])
+        self.assertIn("plan mode", plan["messages"][0]["content"])
+        self.assertFalse(build["readonly"])
+        self.assertNotIn("plan mode", build["messages"][0]["content"])
 
+    def test_plan_answers_that_looked_at_files_end_with_a_no_files_changed_note(self):
+        async def reply(call):
+            text = call["messages"][-1]["content"]
+            if text != "chat":
+                yield ToolEvent("read", "running", "calc.py")
+                yield ToolEvent("read", "finished", "calc.py")
+            yield {
+                "plan": "1. Fix divide.",
+                "chat": "Hi.",
+                "refuse": "Plan mode is read-only, so I can't change files.",
+                "says": "1. Fix it. No files were changed.",
+                "build": "Done.",
+            }[text]
 
+        replies = Replies(reply, reply, reply, reply, reply)
+        note = "Plan mode: no files changed."
 
+        async def driver(app, pipe, transcript):
+            await say(pipe, "/plan")
+            for count, text in enumerate(["plan", "chat", "refuse", "says"], 1):
+                await say(pipe, text)
+                await wait_for(lambda: transcript.plain().count(FOOTER) == count)
+            await say(pipe, "/build")
+            await say(pipe, "build")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 5)
+            plain = transcript.plain()
+            self.assertEqual(plain.count(note), 1)
+            self.assertRegex(plain, r"1\. Fix divide\.\s+Plan mode: no files changed\.\s+" + re.escape(FOOTER.split(" | ")[0]))
+            self.assertRegex(plain, r"Hi\.\s+" + re.escape(FOOTER.split(" | ")[0]))
 
-
+        self.run_main(driver, replies)
+        system = replies.calls[0]["messages"][0]["content"]
+        self.assertIn("read-only", system)
+        self.assertIn("Press Tab to switch to Build", system)
+        self.assertIn("never say that yourself", system)
 
     def test_new_and_clear_start_fresh_sessions(self):
         replies = Replies()

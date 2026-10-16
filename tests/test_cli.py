@@ -41,7 +41,7 @@ class CliTest(CliCase):
         original_sleep = asyncio.sleep
         transcripts = []
 
-        async def fake_reply(messages, model=None, connection=None):
+        async def fake_reply(messages, model=None, connection=None, readonly=False, *args, **kwargs):
             requests.append(messages)
             await original_sleep(0.02)
             content = messages[-1]["content"]
@@ -76,8 +76,8 @@ class CliTest(CliCase):
             await wait_for(lambda: app.current_buffer.text == "draft for later")
             pipe.send_text("\x03")
             await wait_for(lambda: app.current_buffer.text == "")
-            pipe.send_text("/exp\r")
-            await wait_for(lambda: "No file changes yet." in transcript.plain())
+            pipe.send_text("/pla\r")
+            await wait_for(lambda: "Plan mode: Joy investigates" in transcript.plain())
             pipe.send_text("/nope\r")
             await wait_for(lambda: "Unknown command /nope" in transcript.plain())
 
@@ -123,7 +123,7 @@ class CliTest(CliCase):
     def test_sessions_are_saved_continued_and_switched(self):
         requests = []
 
-        async def fake_reply(messages, model=None, connection=None):
+        async def fake_reply(messages, model=None, connection=None, readonly=False, *args, **kwargs):
             requests.append(messages)
             yield "Reply to " + messages[-1]["content"] + "."
 

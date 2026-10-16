@@ -20,6 +20,16 @@ from aisuite.utils.tools import Tools
 OUTPUT_LIMIT = 20_000
 FILE_LIMIT = 2_000_000
 MAX_TRACKED_FILES = 20
+READONLY_COMMANDS = {
+    "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "tree", "pwd", "file", "stat",
+    "du", "diff", "cut", "uniq", "basename", "dirname", "which", "git",
+}
+READONLY_GIT = {"status", "log", "diff", "show", "ls-files", "blame", "rev-parse", "describe", "shortlog", "grep"}
+UNSAFE_FLAGS = {
+    "find": ("-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"),
+    "rg": ("--pre", "--pre-glob"),
+    "git": ("--output", "--ext-diff", "--textconv"),
+}
 # ponytail: serialize file mutations globally; use per-file locks if concurrency grows.
 MUTATION_LOCK = Lock()
 
@@ -137,8 +147,62 @@ def _named_files(root: Path, command: str) -> dict[Path, str]:
     return found
 
 
+def _reaches_outside(root: Path, argument: str) -> bool:
+    for candidate in (argument, argument.split("=", 1)[1] if "=" in argument else ""):
+        if not candidate or candidate.startswith("-") and "=" not in candidate:
+            continue
+        if candidate.startswith(("/", "~")) or ".." in candidate:
+            try:
+                target = (root / Path(candidate).expanduser()).resolve()
+            except (OSError, RuntimeError):
+                return True
+            if not target.is_relative_to(root) and target.exists():
+                return True
+    return False
+
+
+def _check_readonly(root: Path, command: str) -> None:
+    if any(mark in command for mark in ("\n", "`", "$(", "<(", ">(")):
+        raise ValueError("Plan mode only runs single-line read-only commands.")
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError as error:
+        raise ValueError(f"Could not parse the command: {error}") from error
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token == "|":
+            segments.append([])
+        elif token and all(char in ";&|<>()" for char in token):
+            raise ValueError(f"'{token}' is not allowed in plan mode; only pipes between read-only commands.")
+        else:
+            segments[-1].append(token)
+    for segment in segments:
+        if not segment or segment[0] not in READONLY_COMMANDS:
+            allowed = ", ".join(sorted(READONLY_COMMANDS))
+            raise ValueError(f"Plan mode only allows these read-only commands: {allowed}.")
+        name, arguments = segment[0], segment[1:]
+        if name == "git" and (not arguments or arguments[0] not in READONLY_GIT):
+            raise ValueError("Plan mode only allows git " + ", ".join(sorted(READONLY_GIT)) + ".")
+        for argument in arguments:
+            if any(argument == flag or argument.startswith(flag + "=") for flag in UNSAFE_FLAGS.get(name, ())):
+                raise ValueError(f"'{argument}' is not allowed in plan mode.")
+            if _reaches_outside(root, argument):
+                raise ValueError("Plan mode can only look inside the workspace.")
+
+
+def is_readonly_command(root: Path, command: str) -> bool:
+    try:
+        _check_readonly(root.resolve(), command)
+    except ValueError:
+        return False
+    return True
+
+
 def create_tools(
     workspace: Path, cancelled: Event, on_change: Callable[[Change], None] | None = None,
+    readonly: bool = False,
 ) -> Tools:
     root = workspace.resolve()
 
@@ -242,4 +306,16 @@ def create_tools(
                 record(Change(label, "created", "", updated))
         return result
 
-    return Tools([read, write, edit, bash])
+    if not readonly:
+        return Tools([read, write, edit, bash])
+
+    def inspect(command: str, timeout: int = 30) -> str:
+        """Run a read-only command in the workspace (ls, cat, head, tail, grep, rg, find, tree, wc, file, stat,
+        du, diff, git status/log/diff/show). Pipes between these are allowed; redirects, chaining, and anything
+        that changes files are rejected. Timeout is 1-300 seconds.
+        """
+        _check_readonly(root, command)
+        return bash(command, timeout)
+
+    inspect.__name__ = "bash"
+    return Tools([read, inspect])
