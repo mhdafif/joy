@@ -87,8 +87,14 @@ LOGO = (
     "╚█████╔╝╚██████╔╝   ██║   ",
     " ╚════╝  ╚═════╝    ╚═╝   ",
 )
+COMPACT_REQUEST = (
+    "Summarize our conversation so far so that you can continue the work later without the original messages. "
+    "Include the user's goals, decisions made, files created or changed (with paths), commands run and their "
+    "results, open problems, and next steps. Be specific and concise, with no preamble."
+)
 COMMANDS = dict(sorted({
     "/expand": "show a full diff",
+    "/compact": "summarize the conversation to free up context",
     "/undo": "undo a task: revert its file changes and rewind the chat",
     "/build": "build mode: Joy can change files",
     "/plan": "plan mode: Joy only investigates and proposes a plan",
@@ -132,6 +138,10 @@ def matching_commands(text: str, table: dict[str, str] | None = None) -> list[st
     if not text.startswith("/") or any(char.isspace() for char in text):
         return []
     return [command for command in (table or COMMANDS) if command.startswith(text)]
+
+
+def format_count(count: int) -> str:
+    return str(count) if count < 1000 else f"{count / 1000:.1f}k"
 
 
 class PlaceholderProcessor(Processor):
@@ -304,6 +314,7 @@ def main(argv: list[str] | None = None) -> None:
     approve_all = False
     approval: tuple[str, Callable[[str], None]] | None = None
     approval_index = 0
+    context_tokens = 0
     status_label = "Thinking…"
     skills = discover_skills(Path(workspace))
     instruction_files = load_instructions(Path(workspace))[1]
@@ -567,10 +578,12 @@ def main(argv: list[str] | None = None) -> None:
     def render_footer() -> StyleAndTextTuples:
         width = get_app().output.get_size().columns
         source = connection.name if len(connections) > 1 else ""
-        used = get_cwidth(model) + (get_cwidth(source) + 1 if source else 0)
+        estimate = context_tokens or sum(len(str(m.get("content", ""))) for m in history[1:]) // 4
+        meter = f"{'' if context_tokens else '~'}{format_count(estimate)} ctx  " if estimate else ""
+        used = get_cwidth(meter) + get_cwidth(model) + (get_cwidth(source) + 1 if source else 0)
         badge = (t.badge_plan, " PLAN  ") if mode == "plan" else (t.badge_build, " BUILD ")
         gap = max(2, width - get_cwidth(badge[1]) - get_cwidth(folder) - used - 2)
-        fragments = [badge, (t.muted, f" {folder}"), ("", " " * gap), (t.text_dim, model)]
+        fragments = [badge, (t.muted, f" {folder}"), ("", " " * gap), (t.subtle, meter), (t.text_dim, model)]
         if source:
             fragments.append((t.subtle, f" {source}"))
         return [*fragments, ("", " ")]
@@ -666,8 +679,9 @@ def main(argv: list[str] | None = None) -> None:
         elif kind == "changes":
             for item in event["items"]:
                 session_changes.append(Change(**item))
-                if print_change(len(session_changes)):
-                    collapsed.append(len(session_changes))
+            emit()
+        elif kind == "compact":
+            emit(Text(f"↺ Conversation compacted: ~{format_count(event['before'])} → ~{format_count(event['after'])} tokens", style="dim"))
             emit()
         elif kind == "footer":
             details = [event["model"], format_elapsed(event["elapsed"])]
@@ -758,9 +772,10 @@ def main(argv: list[str] | None = None) -> None:
         show_banner()
 
     def load_session(chosen: Session) -> None:
-        nonlocal current, history
+        nonlocal current, history, context_tokens
         current = chosen
         history = [system_for(mode), *chosen.messages]
+        context_tokens = 0
         reset_view()
         for event in chosen.events:
             render_event(event)
@@ -768,9 +783,10 @@ def main(argv: list[str] | None = None) -> None:
         get_app().invalidate()
 
     def start_new_session() -> None:
-        nonlocal current, history
+        nonlocal current, history, context_tokens
         current = None
         history = [system_for(mode)]
+        context_tokens = 0
         reset_view()
         get_app().invalidate()
 
@@ -839,7 +855,7 @@ def main(argv: list[str] | None = None) -> None:
         return index, len(files)
 
     def perform_undo(event: dict) -> None:
-        nonlocal current
+        nonlocal current, context_tokens
         info = undo_info(event)
         if info is None or current is None:
             emit(Text("This message cannot be undone.", style="dim"))
@@ -1150,7 +1166,7 @@ def main(argv: list[str] | None = None) -> None:
     async def run_turn(
         messages: list[dict[str, str]], used_model: str, used_connection: Connection, readonly: bool,
     ) -> None:
-        nonlocal history, waiting, answer, tokens, used_tools
+        nonlocal history, waiting, answer, tokens, used_tools, context_tokens
         outcome = "done"
         failure: Exception | None = None
         try:
@@ -1163,6 +1179,8 @@ def main(argv: list[str] | None = None) -> None:
                         pending.append(chunk)
                     elif isinstance(chunk, Usage):
                         tokens += chunk.tokens
+                        if chunk.input_tokens:
+                            context_tokens = chunk.input_tokens
                     elif isinstance(chunk, Approval):
                         request_approval(chunk)
                     else:
@@ -1237,6 +1255,60 @@ def main(argv: list[str] | None = None) -> None:
         )
         app.create_background_task(tick())
 
+    def context_estimate() -> int:
+        return context_tokens or sum(len(str(m.get("content", ""))) for m in history[1:]) // 4
+
+    async def run_compact() -> None:
+        nonlocal waiting, status_label, history, context_tokens
+        summary = ""
+        failure: Exception | None = None
+        stopped = False
+        try:
+            async with aclosing(stream_reply(
+                [system_for(mode), *history[1:], {"role": "user", "content": COMPACT_REQUEST}],
+                model, connection, True, use_tools=False,
+            )) as stream:
+                async for chunk in stream:
+                    if isinstance(chunk, str):
+                        summary += chunk
+        except asyncio.CancelledError:
+            stopped = True
+        except Exception as error:
+            failure = error
+        waiting = False
+        status_label = "Thinking…"
+        if stopped:
+            emit(Text("Compaction cancelled.", style="dim"))
+        elif failure is not None:
+            emit(Text(str(failure), style=t.danger))
+        elif not summary.strip():
+            emit(Text("The model returned an empty summary, so nothing changed.", style="dim"))
+        else:
+            before = context_estimate()
+            history = [
+                system_for(mode),
+                {"role": "user", "content": "Summary of our earlier conversation:\n\n" + summary.strip()},
+                {"role": "assistant", "content": "Understood. I will continue from this summary."},
+            ]
+            context_tokens = 0
+            record({"t": "compact", "summary": summary.strip(), "before": before, "after": context_estimate()})
+        emit()
+        if queue:
+            start_turn(queue.pop(0))
+
+    def start_compact() -> None:
+        nonlocal waiting, started, status_label, task
+        if len(history) <= 1:
+            emit(Text("There is nothing to compact yet.", style="dim"))
+            emit()
+            return
+        waiting = True
+        started = time.monotonic()
+        status_label = "Compacting…"
+        app = get_app()
+        task = app.create_background_task(run_compact())
+        app.create_background_task(tick())
+
     def set_mode(new_mode: str) -> None:
         nonlocal mode
         if new_mode == mode:
@@ -1282,6 +1354,9 @@ def main(argv: list[str] | None = None) -> None:
             return
         if message == "/connect":
             open_connect()
+            return
+        if message == "/compact":
+            start_compact()
             return
         if message == "/undo":
             last = next((e for e in reversed(current.events) if e["t"] == "user"), None) if current else None

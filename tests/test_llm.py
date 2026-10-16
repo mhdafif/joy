@@ -10,7 +10,8 @@ from unittest.mock import patch
 
 import httpx
 from openai import OpenAI
-from joy.llm import MODEL, Approval, ToolEvent, stream_reply
+
+from joy.llm import MODEL, Approval, ToolEvent, Usage, stream_reply
 from joy.skills import Skill
 from joy.tools import Change
 
@@ -182,6 +183,14 @@ class LlmTest(unittest.IsolatedAsyncioTestCase):
                         chunk.decision.resolve(approve_with)
             return chunks, payloads, Path(directory)
 
+    async def test_usage_and_tool_details_are_reported(self):
+        chunks, _, _ = await self.run_two_step_reply([self.tool_call('read', path='missing.txt')])
+        self.assertEqual([c for c in chunks if isinstance(c, Usage)], [Usage(120, 100), Usage(50, 40)])
+        events = [c for c in chunks if isinstance(c, ToolEvent)]
+        self.assertEqual(events[0], ToolEvent('read', 'running', 'missing.txt'))
+        self.assertEqual((events[1].name, events[1].status), ('read', 'failed'))
+        self.assertIn('missing.txt', events[1].detail)
+
     async def test_long_commands_are_flattened_and_shortened_in_the_step_detail(self):
         command = 'echo ' + 'x' * 300 + '\necho done'
         chunks, _, _ = await self.run_two_step_reply([self.tool_call('bash', command=command)])
@@ -198,6 +207,19 @@ class LlmTest(unittest.IsolatedAsyncioTestCase):
         skill = Skill('demo', 'Demo', Path('/nowhere/SKILL.md'))
         _, payloads, _ = await self.run_two_step_reply([self.tool_call('read', path='x')], skills={'demo': skill})
         self.assertEqual([tool['name'] for tool in payloads[0]['tools']], ['read', 'write', 'edit', 'bash', 'skill'])
+
+    async def test_tools_can_be_switched_off_for_summaries(self):
+        payloads = []
+
+        def respond(request):
+            payloads.append(json.loads(request.content))
+            return sse([{'type': 'response.output_text.delta', 'delta': 'Summary.'}, completed()])
+
+        with self.client_patch(respond):
+            chunks = [c async for c in stream_reply([{'role': 'user', 'content': 'Summarize'}], use_tools=False)]
+        self.assertEqual(chunks, ['Summary.'])
+        self.assertNotIn('tools', payloads[0])
+        self.assertNotIn('parallel_tool_calls', payloads[0])
 
     async def test_commands_wait_for_approval_and_obey_the_answer(self):
         for allowed in (True, False):

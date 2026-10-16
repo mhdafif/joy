@@ -32,6 +32,7 @@ class ToolEvent:
 @dataclass(frozen=True)
 class Usage:
     tokens: int
+    input_tokens: int = 0
 
 
 class Decision:
@@ -109,7 +110,7 @@ def list_models(connection: Connection | None = None) -> list[str]:
 
 async def stream_reply(
     messages: list[dict], model: str | None = None, connection: Connection | None = None,
-    readonly: bool = False, skills: dict | None = None, ask_approval: bool = False,
+    readonly: bool = False, skills: dict | None = None, ask_approval: bool = False, use_tools: bool = True,
 ) -> AsyncIterator[str | ToolEvent | Change | Usage | Approval]:
     model = model or DEFAULT_MODEL
     result: Queue[str | ToolEvent | Change | Usage | Approval | Exception | None] = Queue()
@@ -139,14 +140,16 @@ async def stream_reply(
                     return
                 text = ""
                 completed = None
-                with client.responses.create(
-                    model=model, input=conversation, stream=True,
-                    reasoning={"effort": "medium"}, store=False,
-                    include=["reasoning.encrypted_content"],
-                    tools=[{"type": "function", **tool["function"], "strict": False}
-                           for tool in toolbox.tools()],
-                    parallel_tool_calls=False,
-                ) as stream:
+                options = {
+                    "model": model, "input": conversation, "stream": True,
+                    "reasoning": {"effort": "medium"}, "store": False,
+                    "include": ["reasoning.encrypted_content"],
+                }
+                if use_tools:
+                    options["tools"] = [{"type": "function", **tool["function"], "strict": False}
+                                        for tool in toolbox.tools()]
+                    options["parallel_tool_calls"] = False
+                with client.responses.create(**options) as stream:
                     for event in stream:
                         if cancelled.is_set():
                             return
@@ -161,8 +164,11 @@ async def stream_reply(
                     raise ValueError("Empty or incomplete response")
                 total = getattr(getattr(completed, "usage", None), "total_tokens", None)
                 if isinstance(total, int) and total > 0:
-                    result.put(Usage(total))
+                    prompt_tokens = getattr(getattr(completed, "usage", None), "input_tokens", 0)
+                    result.put(Usage(total, prompt_tokens if isinstance(prompt_tokens, int) else 0))
                 calls = [item for item in completed.output if item.type == "function_call"]
+                if not use_tools:
+                    calls = []
                 if not calls:
                     if not text.strip():
                         raise ValueError("Empty or incomplete response")

@@ -344,6 +344,38 @@ class ModesAndContextTest(CliCase):
         self.assertEqual([m["role"] for m in replies.calls[1]["messages"]], ["system", "user"])
         self.assertEqual(sorted(s.name for s in list_sessions(str(Path.cwd().resolve()))), ["one", "two"])
 
+    def test_compact_replaces_the_history_with_a_summary(self):
+        async def summarize(call):
+            self.assertFalse(call["use_tools"])
+            self.assertIn("Summarize our conversation", last_user_text(call["messages"]))
+            yield "THE SUMMARY"
+
+        replies = Replies(None, summarize)
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "first")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            await say(pipe, "/compact")
+            await wait_for(lambda: "Conversation compacted" in transcript.plain())
+            await say(pipe, "next")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 2)
+
+        self.run_main(driver, replies)
+        messages = replies.calls[2]["messages"]
+        self.assertEqual([m["role"] for m in messages], ["system", "user", "assistant", "user"])
+        self.assertEqual(messages[1]["content"], "Summary of our earlier conversation:\n\nTHE SUMMARY")
+        self.assertEqual(messages[3]["content"], "next")
+
+    def test_compact_with_nothing_to_summarize_does_nothing(self):
+        replies = Replies()
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "/compact")
+            await wait_for(lambda: "nothing to compact" in transcript.plain())
+
+        self.run_main(driver, replies)
+        self.assertEqual(replies.calls, [])
+
     def test_opening_the_command_list_does_not_resize_the_conversation(self):
         replies = Replies()
 
