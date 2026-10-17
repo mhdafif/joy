@@ -45,6 +45,7 @@ from joy.connections import (
 from joy.approvals import is_allowed, suggest_prefix
 from joy.clipboard import copy_text, osc52
 from joy.export import to_markdown
+from joy.folder import open_folder, shorten_folder
 from joy.instructions import load_instructions
 from joy.diffview import COLLAPSE_LABEL, COLLAPSED_LINES, EXPAND_LABEL, merge_changes, render_change
 from joy.mentions import (
@@ -585,6 +586,14 @@ def main(argv: list[str] | None = None) -> None:
     def menu_height() -> int:
         return 2 + len(queue) if waiting else 2
 
+    def open_workspace(mouse_event: MouseEvent):
+        if mouse_event.event_type != MouseEventType.MOUSE_UP:
+            return NotImplemented
+        if not open_folder(Path(workspace)):
+            emit(Text("Could not open the folder.", style="dim"))
+            emit()
+        return None
+
     def render_footer() -> StyleAndTextTuples:
         width = get_app().output.get_size().columns
         source = connection.name if len(connections) > 1 else ""
@@ -592,8 +601,9 @@ def main(argv: list[str] | None = None) -> None:
         meter = f"{'' if context_tokens else '~'}{format_count(estimate)} ctx  " if estimate else ""
         used = get_cwidth(meter) + get_cwidth(model) + (get_cwidth(source) + 1 if source else 0)
         badge = (t.badge_plan, " PLAN  ") if mode == "plan" else (t.badge_build, " BUILD ")
-        gap = max(2, width - get_cwidth(badge[1]) - get_cwidth(folder) - used - 2)
-        fragments = [badge, (t.muted, f" {folder}"), ("", " " * gap), (t.subtle, meter), (t.text_dim, model)]
+        shown = shorten_folder(folder, max(width - get_cwidth(badge[1]) - used - 4, 8))
+        gap = max(2, width - get_cwidth(badge[1]) - get_cwidth(shown) - used - 2)
+        fragments = [badge, (t.muted, f" {shown}", open_workspace), ("", " " * gap), (t.subtle, meter), (t.text_dim, model)]
         if source:
             fragments.append((t.subtle, f" {source}"))
         return [*fragments, ("", " ")]

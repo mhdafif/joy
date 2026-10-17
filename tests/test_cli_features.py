@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import re
 from pathlib import Path
 from unittest.mock import patch
@@ -13,7 +14,7 @@ from prompt_toolkit.mouse_events import MouseButton, MouseEvent, MouseEventType
 
 from harness import DOWN, ESCAPE, FOOTER, UP, CliCase, Replies, last_user_text, settle, wait_for
 from joy.connections import DEFAULT_NAME, Connection, load_connections, save_connection, save_selection
-from joy.llm import Approval, Decision, ToolEvent
+from joy.llm import MODEL, Approval, Decision, ToolEvent
 from joy.settings import load_settings
 from joy.sessions import list_sessions, new_session, save_session
 from joy.theme import active
@@ -690,6 +691,57 @@ class ApprovalTest(CliCase):
             [(command, decision.allowed) for command, decision in decisions],
             [("rm -rf build", False), ("touch b", True), ("touch c", False)],
         )
+
+
+def window_fragments(app, needle):
+    for window in app.layout.find_all_windows():
+        control = window.content
+        if isinstance(control, FormattedTextControl) and callable(control.text):
+            fragments = control.text()
+            if needle in to_plain_text(fragments):
+                return fragments
+    return None
+
+
+def mouse(kind):
+    return MouseEvent(Point(1, 0), kind, MouseButton.LEFT, frozenset())
+
+
+def handler_for(fragments, text):
+    return next(fragment[2] for fragment in fragments if text in fragment[1] and len(fragment) == 3)
+
+
+class FooterTest(CliCase):
+    def test_a_long_folder_is_shortened_so_the_model_stays_visible_and_clicking_it_opens_it(self):
+        deep = Path(self.workspace.name) / ("long-directory-name-" * 4) / "project"
+        deep.mkdir(parents=True)
+        os.chdir(deep)
+        opened = patch("joy.cli.open_folder", return_value=True)
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "hi")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            fragments = window_fragments(app, "ctx")
+            text = to_plain_text(fragments)
+            self.assertLessEqual(len(text), 80)
+            self.assertIn(MODEL.split(":", 1)[1], text)
+            self.assertIn("ctx", text)
+            self.assertIn("…/", text)
+            handler_for(fragments, "…/")(mouse(MouseEventType.MOUSE_UP))
+
+        with opened as opener:
+            self.run_main(driver, Replies())
+        opener.assert_called_once_with(deep.resolve())
+
+    def test_a_folder_that_cannot_be_opened_says_so(self):
+        async def driver(app, pipe, transcript):
+            await say(pipe, "hi")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            handler_for(window_fragments(app, "ctx"), "/")(mouse(MouseEventType.MOUSE_UP))
+            await wait_for(lambda: "Could not open the folder." in transcript.plain())
+
+        with patch("joy.cli.open_folder", return_value=False):
+            self.run_main(driver, Replies())
 
 
 class UndoTest(CliCase):
