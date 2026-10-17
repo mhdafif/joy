@@ -1586,6 +1586,9 @@ def main(argv: list[str] | None = None) -> None:
         options = suggestions()
         apply_suggestion(options[min(selected, len(options) - 1)])
 
+    def is_command(message: str) -> bool:
+        return message.partition(" ")[0] in commands() or (message.startswith("/") and not any(c.isspace() for c in message))
+
     def send_input() -> None:
         options = suggestions()
         if options and apply_suggestion(options[min(selected, len(options) - 1)]):
@@ -1609,7 +1612,7 @@ def main(argv: list[str] | None = None) -> None:
         if not message and queue:
             start_turn(queue.pop(0))
             return
-        buffer.reset(append_to_history=True)
+        buffer.reset(append_to_history=not is_command(message))
         handle(message)
 
     @bindings.add("enter")

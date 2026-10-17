@@ -832,6 +832,30 @@ class CommandListMouseTest(CliCase):
         self.run_main(driver, replies)
 
 
+class InputHistoryTest(CliCase):
+    def test_slash_commands_are_not_kept_in_the_input_history(self):
+        async def driver(app, pipe, transcript):
+            await say(pipe, "hello")
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            await say(pipe, "/new")
+            await settle(0.2)
+            await say(pipe, "/theme")
+            await settle(0.25)
+            pipe.send_text(ESCAPE)
+            await settle(0.25)
+            await say(pipe, "/export")
+            await settle(0.2)
+            await say(pipe, "/nonsense")
+            await settle(0.2)
+            pipe.send_text(UP)
+            await wait_for(lambda: app.current_buffer.text == "hello")
+            pipe.send_text(UP)
+            await settle(0.2)
+            self.assertEqual(app.current_buffer.text, "hello")
+
+        self.run_main(driver, Replies())
+
+
 class UndoTest(CliCase):
     def two_file_turns(self):
         async def write(call, content, kind, before):
