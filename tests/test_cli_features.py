@@ -580,6 +580,46 @@ class ApprovalTest(CliCase):
         self.run_main(driver, replies)
         self.assertEqual([allowed for _, allowed in outcomes], [True, True, True, False])
 
+    def test_a_long_multi_line_command_keeps_every_choice_visible(self):
+        outcomes = []
+
+        def turn(command):
+            async def behave(call):
+                decision = Decision()
+                yield Approval("bash", command, decision)
+                while not decision.event.is_set():
+                    await asyncio.sleep(0.01)
+                outcomes.append((command, decision.allowed))
+                yield "ok"
+            return behave
+
+        command = "cd src 2>/dev/null; python3 -c \"\n" + "\n".join(f"assert add({n}, 1) == {n + 1}" for n in range(40)) + "\n\""
+        replies = Replies(turn(command))
+
+        def panel(app):
+            for window in app.layout.find_all_windows():
+                control = window.content
+                if isinstance(control, FormattedTextControl) and callable(control.text):
+                    fragments = control.text()
+                    if "Allow this command?" in to_plain_text(fragments):
+                        return window, fragments
+            return None, None
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "go")
+            await wait_for(lambda: panel(app)[1] is not None)
+            window, fragments = panel(app)
+            text = to_plain_text(fragments)
+            self.assertEqual(text.count("\n") + 1, window.height())
+            for expected in ["1  Allow once", "2  Allow all commands this session", "3  Always allow", "4  Deny", "more lines"]:
+                self.assertIn(expected, text)
+            self.assertIn("python3 -c", text)
+            pipe.send_text("4")
+            await wait_for(lambda: len(outcomes) == 1)
+
+        self.run_main(driver, replies)
+        self.assertFalse(outcomes[0][1])
+
     def test_allow_all_ends_with_the_session(self):
         outcomes = []
 

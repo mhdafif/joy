@@ -1176,9 +1176,13 @@ def main(argv: list[str] | None = None) -> None:
         if approval is None:
             return []
         width = get_app().output.get_size().columns
-        lines = textwrap.wrap(approval[0], max(width - 4, 20), replace_whitespace=False) or [""]
-        if len(lines) > 3:
-            lines = [*lines[:2], lines[2][:max(width - 5, 19)] + "…"]
+        room = max(width - 4, 20)
+        lines: list[str] = []
+        for raw in approval[0].expandtabs(4).splitlines() or [""]:
+            lines += textwrap.wrap(raw, room, replace_whitespace=False, drop_whitespace=False) or [""]
+        limit = max(3, min(12, get_app().output.get_size().rows - 14))
+        if len(lines) > limit:
+            lines = [*lines[:limit - 1], f"… {len(lines) - limit + 1} more lines"]
         rows: list[list[tuple]] = [[(t.row_skill, " Allow this command?".ljust(width))]]
         rows.extend([(t.row, f"  {line}".ljust(width))] for line in lines)
         for index, (value, label) in enumerate(APPROVAL_CHOICES):
