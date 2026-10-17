@@ -489,161 +489,152 @@ class ModesAndContextTest(CliCase):
         self.assertTrue(seen)
 
 
+def approval_replies(*commands):
+    decisions = []
+
+    def turn(command):
+        async def behave(call):
+            decision = Decision()
+            decisions.append((command, decision))
+            yield ToolEvent("bash", "running", command)
+            yield Approval("bash", command, decision)
+            while not decision.event.is_set():
+                await asyncio.sleep(0.01)
+            yield "ok"
+        return behave
+
+    return Replies(*[turn(command) for command in commands]), decisions
+
+
+def approval_panel(app):
+    for window in app.layout.find_all_windows():
+        control = window.content
+        if isinstance(control, FormattedTextControl) and callable(control.text):
+            fragments = control.text()
+            if "Allow this command?" in to_plain_text(fragments):
+                return window, fragments
+    return None, None
+
+
 class ApprovalTest(CliCase):
     def test_commands_ask_first_and_the_answers_are_remembered(self):
-        outcomes = []
-
-        def turn(command):
-            async def behave(call):
-                decision = Decision()
-                yield Approval("bash", command, decision)
-                while not decision.event.is_set():
-                    await asyncio.sleep(0.01)
-                outcomes.append((command, decision.allowed))
-                yield "ok"
-            return behave
-
-        replies = Replies(*[turn(c) for c in ["touch a", "touch b", "touch b", "touch c", "touch d", "touch e"]])
+        replies, decisions = approval_replies("touch a", "touch b", "touch b", "touch c", "touch d", "touch e")
 
         async def driver(app, pipe, transcript):
-            async def ask(keys, number):
+            async def ask(keys, number, stops=False):
                 await say(pipe, "go")
                 await wait_for(lambda: len(replies.calls) == number)
                 if keys is not None:
                     await settle(0.25)
                     pipe.send_text(keys)
-                await wait_for(lambda: len(outcomes) == number)
-                await wait_for(lambda: transcript.plain().count(FOOTER) == number)
+                await wait_for(lambda: len(decisions) == number and decisions[-1][1].event.is_set())
+                if stops:
+                    await wait_for(lambda: "Stopped: you declined the command." in transcript.plain())
+                else:
+                    await wait_for(lambda: transcript.plain().count(FOOTER) == number - stopped[0])
+                stopped[0] += int(stops)
 
+            stopped = [0]
             await ask("\r", 1)
             self.assertNotIn("allowed_commands", load_settings())
             await ask(DOWN + DOWN + "\r", 2)
             self.assertEqual(load_settings()["allowed_commands"], [{"prefix": "touch b"}])
             await ask(None, 3)
-            await ask(ESCAPE, 4)
+            await ask(ESCAPE, 4, stops=True)
             await ask(DOWN + "\r", 5)
             await ask(None, 6)
 
         self.run_main(driver, replies)
-        self.assertEqual(outcomes, [
+        self.assertEqual([(command, decision.allowed) for command, decision in decisions], [
             ("touch a", True), ("touch b", True), ("touch b", True),
             ("touch c", False), ("touch d", True), ("touch e", True),
         ])
 
-    def test_always_allow_saves_a_prefix_that_covers_the_variants_but_not_chained_commands(self):
-        outcomes = []
-
-        def turn(command):
-            async def behave(call):
-                decision = Decision()
-                yield Approval("bash", command, decision)
-                while not decision.event.is_set():
-                    await asyncio.sleep(0.01)
-                outcomes.append((command, decision.allowed))
-                yield "ok"
-            return behave
-
-        commands = [
-            'python -m unittest 2>&1; echo "EXIT:$?"', 'python -m unittest -v 2>&1',
-            'python -m unittest 2>&1 | tail -5', 'python -m unittest; touch x',
-        ]
-        replies = Replies(*[turn(command) for command in commands])
-
-        def panel(app):
-            for window in app.layout.find_all_windows():
-                control = window.content
-                if isinstance(control, FormattedTextControl) and callable(control.text):
-                    text = to_plain_text(control.text())
-                    if "Allow this command?" in text:
-                        return text
-            return ""
+    def test_declining_a_command_stops_the_reply_and_marks_the_step(self):
+        replies, decisions = approval_replies("touch a")
+        sent = []
 
         async def driver(app, pipe, transcript):
             await say(pipe, "go")
-            await wait_for(lambda: len(replies.calls) == 1)
-            await wait_for(lambda: "Allow this command?" in panel(app))
-            self.assertIn("Always allow python -m unittest …", panel(app))
+            await wait_for(lambda: len(decisions) == 1)
+            await settle(0.25)
+            pipe.send_text("4")
+            await wait_for(lambda: "Stopped: you declined the command." in transcript.plain())
+            plain = transcript.plain()
+            self.assertIn("✗ touch a — You declined to run this command.", plain)
+            self.assertNotIn("ok", plain.split("Stopped")[0].split("go")[-1])
+            self.assertEqual(plain.count(FOOTER), 0)
+            await say(pipe, "again")
+            await wait_for(lambda: len(replies.calls) == 2)
+            sent.append(replies.calls[1]["messages"])
+
+        self.run_main(driver, replies)
+        note = next(m for m in sent[0] if "you asked to run `touch a`" in m["content"])
+        self.assertEqual(note["role"], "user")
+        self.assertIn("The user decided this, not you", note["content"])
+        self.assertTrue(all(m["content"].strip() for m in sent[0]))
+        saved = list_sessions(str(Path.cwd().resolve()))
+        cancelled = next(event for event in saved[0].events if event["t"] == "cancelled")
+        self.assertEqual(cancelled["reason"], "declined")
+
+    def test_always_allow_saves_a_prefix_that_covers_the_variants_but_not_chained_commands(self):
+        replies, decisions = approval_replies(
+            'python -m unittest 2>&1; echo "EXIT:$?"', 'python -m unittest -v 2>&1',
+            'python -m unittest 2>&1 | tail -5', 'python -m unittest; touch x',
+        )
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "go")
+            await wait_for(lambda: approval_panel(app)[1] is not None)
+            self.assertIn("Always allow python -m unittest …", to_plain_text(approval_panel(app)[1]))
             pipe.send_text("3")
-            await wait_for(lambda: len(outcomes) == 1)
+            await wait_for(lambda: len(decisions) == 1 and decisions[0][1].event.is_set())
             await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
             self.assertEqual(load_settings()["allowed_commands"], [{"prefix": "python -m unittest"}])
             for number in (2, 3):
                 await say(pipe, "go")
-                await wait_for(lambda: len(outcomes) == number)
+                await wait_for(lambda: len(decisions) == number and decisions[-1][1].event.is_set())
                 await wait_for(lambda: transcript.plain().count(FOOTER) == number)
             await say(pipe, "go")
             await wait_for(lambda: len(replies.calls) == 4)
-            await wait_for(lambda: "Allow this command?" in panel(app))
+            await wait_for(lambda: approval_panel(app)[1] is not None)
             pipe.send_text(ESCAPE)
-            await wait_for(lambda: len(outcomes) == 4)
+            await wait_for(lambda: len(decisions) == 4 and decisions[-1][1].event.is_set())
 
         self.run_main(driver, replies)
-        self.assertEqual([allowed for _, allowed in outcomes], [True, True, True, False])
+        self.assertEqual([decision.allowed for _, decision in decisions], [True, True, True, False])
 
     def test_a_long_multi_line_command_keeps_every_choice_visible(self):
-        outcomes = []
-
-        def turn(command):
-            async def behave(call):
-                decision = Decision()
-                yield Approval("bash", command, decision)
-                while not decision.event.is_set():
-                    await asyncio.sleep(0.01)
-                outcomes.append((command, decision.allowed))
-                yield "ok"
-            return behave
-
         command = "cd src 2>/dev/null; python3 -c \"\n" + "\n".join(f"assert add({n}, 1) == {n + 1}" for n in range(40)) + "\n\""
-        replies = Replies(turn(command))
-
-        def panel(app):
-            for window in app.layout.find_all_windows():
-                control = window.content
-                if isinstance(control, FormattedTextControl) and callable(control.text):
-                    fragments = control.text()
-                    if "Allow this command?" in to_plain_text(fragments):
-                        return window, fragments
-            return None, None
+        replies, decisions = approval_replies(command)
 
         async def driver(app, pipe, transcript):
             await say(pipe, "go")
-            await wait_for(lambda: panel(app)[1] is not None)
-            window, fragments = panel(app)
+            await wait_for(lambda: approval_panel(app)[1] is not None)
+            window, fragments = approval_panel(app)
             text = to_plain_text(fragments)
             self.assertEqual(text.count("\n") + 1, window.height())
             for expected in ["1  Allow once", "2  Allow all commands this session", "3  Always allow", "4  Deny", "more lines"]:
                 self.assertIn(expected, text)
             self.assertIn("python3 -c", text)
             pipe.send_text("4")
-            await wait_for(lambda: len(outcomes) == 1)
+            await wait_for(lambda: decisions[0][1].event.is_set())
 
         self.run_main(driver, replies)
-        self.assertFalse(outcomes[0][1])
+        self.assertFalse(decisions[0][1].allowed)
 
     def test_allow_all_ends_with_the_session(self):
-        outcomes = []
-
-        def turn(command):
-            async def behave(call):
-                decision = Decision()
-                yield Approval("bash", command, decision)
-                while not decision.event.is_set():
-                    await asyncio.sleep(0.01)
-                outcomes.append((command, decision.allowed))
-                yield "ok"
-            return behave
-
-        replies = Replies(turn("touch a"), turn("touch b"), turn("touch c"))
+        replies, decisions = approval_replies("touch a", "touch b", "touch c")
 
         async def driver(app, pipe, transcript):
             await say(pipe, "go")
             await wait_for(lambda: len(replies.calls) == 1)
             await settle(0.25)
             pipe.send_text(DOWN + "\r")
-            await wait_for(lambda: len(outcomes) == 1)
+            await wait_for(lambda: len(decisions) == 1 and decisions[0][1].event.is_set())
             await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
             await say(pipe, "go")
-            await wait_for(lambda: len(outcomes) == 2)
+            await wait_for(lambda: len(decisions) == 2 and decisions[1][1].event.is_set())
             await wait_for(lambda: transcript.plain().count(FOOTER) == 2)
             await say(pipe, "/new")
             await settle(0.2)
@@ -651,34 +642,19 @@ class ApprovalTest(CliCase):
             await wait_for(lambda: len(replies.calls) == 3)
             await settle(0.25)
             pipe.send_text(ESCAPE)
-            await wait_for(lambda: len(outcomes) == 3)
+            await wait_for(lambda: len(decisions) == 3 and decisions[2][1].event.is_set())
 
         self.run_main(driver, replies)
-        self.assertEqual(outcomes, [("touch a", True), ("touch b", True), ("touch c", False)])
+        self.assertEqual(
+            [(command, decision.allowed) for command, decision in decisions],
+            [("touch a", True), ("touch b", True), ("touch c", False)],
+        )
 
     def test_the_approval_prompt_floats_above_the_input_and_takes_keys_and_clicks(self):
-        outcomes = []
-
-        def turn(command):
-            async def behave(call):
-                decision = Decision()
-                yield Approval("bash", command, decision)
-                while not decision.event.is_set():
-                    await asyncio.sleep(0.01)
-                outcomes.append((command, decision.allowed))
-                yield "ok"
-            return behave
-
-        replies = Replies(turn("rm -rf build"), turn("touch b"), turn("touch c"))
+        replies, decisions = approval_replies("rm -rf build", "touch b", "touch c")
 
         def prompt(app):
-            for window in app.layout.find_all_windows():
-                control = window.content
-                if isinstance(control, FormattedTextControl) and callable(control.text):
-                    fragments = control.text()
-                    if "Allow this command?" in to_plain_text(fragments):
-                        return fragments
-            return None
+            return approval_panel(app)[1]
 
         async def driver(app, pipe, transcript):
             window = next(w for w in app.layout.find_all_windows() if isinstance(w.content, Transcript))
@@ -696,21 +672,24 @@ class ApprovalTest(CliCase):
             await settle(0.1)
             self.assertEqual(app.current_buffer.text, "")
             pipe.send_text("4")
-            await wait_for(lambda: len(outcomes) == 1 and prompt(app) is None)
-            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
+            await wait_for(lambda: decisions[0][1].event.is_set() and prompt(app) is None)
+            await wait_for(lambda: "Stopped: you declined the command." in transcript.plain())
             await say(pipe, "go")
             await wait_for(lambda: prompt(app) is not None)
             handler = next(f[2] for f in prompt(app) if "Allow once" in f[1])
             handler(MouseEvent(Point(1, 0), MouseEventType.MOUSE_UP, MouseButton.LEFT, frozenset()))
-            await wait_for(lambda: len(outcomes) == 2 and prompt(app) is None)
-            await wait_for(lambda: transcript.plain().count(FOOTER) == 2)
+            await wait_for(lambda: decisions[1][1].event.is_set() and prompt(app) is None)
+            await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
             await say(pipe, "go")
             await wait_for(lambda: prompt(app) is not None)
             pipe.send_text(ESCAPE)
-            await wait_for(lambda: len(outcomes) == 3)
+            await wait_for(lambda: len(decisions) == 3 and decisions[2][1].event.is_set())
 
         self.run_main(driver, replies)
-        self.assertEqual(outcomes, [("rm -rf build", False), ("touch b", True), ("touch c", False)])
+        self.assertEqual(
+            [(command, decision.allowed) for command, decision in decisions],
+            [("rm -rf build", False), ("touch b", True), ("touch c", False)],
+        )
 
 
 class UndoTest(CliCase):

@@ -344,6 +344,7 @@ def main(argv: list[str] | None = None) -> None:
     steps_open = False
     used_tools = False
     task: asyncio.Task | None = None
+    declined = ""
     pending: list[Change] = []
     session_changes: list[Change] = []
     change_blocks: dict[int, Block] = {}
@@ -740,7 +741,7 @@ def main(argv: list[str] | None = None) -> None:
                 ))
                 emit()
         elif kind == "cancelled":
-            emit(Text("Response cancelled.", style="dim"))
+            emit(Text("Stopped: you declined the command." if event.get("reason") == "declined" else "Response cancelled.", style="dim"))
             emit()
         elif kind == "error":
             emit(Text(event["text"], style=t.danger))
@@ -1144,7 +1145,7 @@ def main(argv: list[str] | None = None) -> None:
         prefix = suggest_prefix(Path(workspace), request.detail)
 
         def decide(value: str) -> None:
-            nonlocal approve_all, status_label
+            nonlocal approve_all, status_label, declined
             status_label = "Thinking…"
             if value == "always":
                 values = load_settings()
@@ -1157,6 +1158,15 @@ def main(argv: list[str] | None = None) -> None:
             elif value == "session":
                 approve_all = True
             request.decision.resolve(value != "deny")
+            if value == "deny":
+                declined = request.detail
+                for part in reversed(parts):
+                    if part["t"] == "tool" and part["status"] == "running":
+                        part["status"] = "failed"
+                        part["error"] = "You declined to run this command."
+                        break
+                if task is not None:
+                    task.cancel()
 
         nonlocal approval, approval_index
         approval = (request.detail, decide, prefix)
@@ -1243,9 +1253,20 @@ def main(argv: list[str] | None = None) -> None:
         if outcome == "done":
             history = [*messages, {"role": "assistant", "content": answer}]
         elif used_tools:
-            note = "Cancelled during tool use" if outcome == "cancelled" else "Interrupted during tool use"
-            history = [*messages, {"role": "assistant", "content": answer +
-                f"\n{note}. Changes may already exist; inspect before retrying."}]
+            if declined:
+                history = [
+                    *messages,
+                    *([{"role": "assistant", "content": answer}] if answer.strip() else []),
+                    {"role": "user", "content": (
+                        f"[Joy: you asked to run `{declined}`. The user chose Deny and stopped your reply, so the "
+                        "command never ran. The user decided this, not you, and the command may be fine. Do not run it "
+                        "again, or a variation of it, unless the user asks. If asked what happened, say the user "
+                        "declined it and answer without running tools.]")},
+                ]
+            else:
+                note = "Cancelled during tool use" if outcome == "cancelled" else "Interrupted during tool use"
+                history = [*messages, {"role": "assistant", "content": answer +
+                    f"\n{note}. Changes may already exist; inspect before retrying."}]
         closing = parts.pop() if parts and parts[-1]["t"] == "text" and parts[-1]["text"].strip() else None
         for part in parts:
             if part["t"] != "text" or part["text"].strip():
@@ -1258,7 +1279,7 @@ def main(argv: list[str] | None = None) -> None:
         if outcome == "done":
             record({"t": "footer", "model": used_model, "elapsed": elapsed, "tokens": tokens})
         elif outcome == "cancelled":
-            record({"t": "cancelled"})
+            record({"t": "cancelled", "reason": "declined"} if declined else {"t": "cancelled"})
         else:
             record({"t": "error", "text": str(failure)})
         if queue:
@@ -1269,7 +1290,7 @@ def main(argv: list[str] | None = None) -> None:
                 start_turn(queue.pop(0))
 
     def start_turn(message: str, display: str | None = None) -> None:
-        nonlocal waiting, started, answer, tokens, used_tools, task, skills
+        nonlocal waiting, started, answer, tokens, used_tools, task, skills, declined
         skills = discover_skills(Path(workspace))
         used = mentioned_skills(message, skills)
         sent = message
@@ -1279,6 +1300,7 @@ def main(argv: list[str] | None = None) -> None:
         content, attached = expand_mentions(Path(workspace), sent)
         record({"t": "user", "text": display or message, "attached": attached, "base": len(history) - 1})
         waiting = True
+        declined = ""
         started = time.monotonic()
         answer = ""
         tokens = 0
