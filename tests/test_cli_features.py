@@ -17,7 +17,7 @@ from joy.connections import DEFAULT_NAME, Connection, load_connections, save_con
 from joy.llm import MODEL, Approval, Decision, ToolEvent
 from joy.settings import load_settings
 from joy.sessions import list_sessions, new_session, save_session
-from joy.theme import active
+from joy.theme import active, t
 from joy.tools import Change
 from joy.transcript import Transcript
 
@@ -742,6 +742,94 @@ class FooterTest(CliCase):
 
         with patch("joy.cli.open_folder", return_value=False):
             self.run_main(driver, Replies())
+
+
+class ModalMouseTest(CliCase):
+    def selected_text(self, app):
+        return next(fragment[1] for fragment in window_fragments(app, "Cetak Biru") if fragment[0] == t.selected)
+
+    def test_the_wheel_moves_through_a_picker_and_a_click_chooses_a_row(self):
+        async def driver(app, pipe, transcript):
+            await say(pipe, "/theme")
+            await settle(0.25)
+            first = self.selected_text(app)
+            handler_for(window_fragments(app, "Cetak Biru"), "Orchid")(mouse(MouseEventType.SCROLL_DOWN))
+            await settle(0.1)
+            second = self.selected_text(app)
+            self.assertNotEqual(first, second)
+            handler_for(window_fragments(app, "Cetak Biru"), second.strip("● ").split()[0])(mouse(MouseEventType.SCROLL_UP))
+            await settle(0.1)
+            self.assertEqual(self.selected_text(app), first)
+            handler_for(window_fragments(app, "Cetak Biru"), "Orchid")(mouse(MouseEventType.MOUSE_UP))
+            await settle(0.25)
+            self.assertIsNone(window_fragments(app, "Cetak Biru"))
+            self.assertEqual(load_settings()["theme"], "orchid")
+
+        self.run_main(driver, Replies())
+
+    def test_the_esc_label_closes_every_kind_of_modal(self):
+        async def driver(app, pipe, transcript):
+            main_input = app.layout.current_window
+            await say(pipe, "/theme")
+            await settle(0.25)
+            handler_for(window_fragments(app, "Select theme"), "esc")(mouse(MouseEventType.MOUSE_UP))
+            await settle(0.25)
+            self.assertIsNone(window_fragments(app, "Cetak Biru"))
+            await say(pipe, "/connect")
+            await settle(0.25)
+            handler_for(window_fragments(app, "Connect an integration"), "esc")(mouse(MouseEventType.MOUSE_UP))
+            await settle(0.25)
+            self.assertIs(app.layout.current_window, main_input)
+
+        self.run_main(driver, Replies())
+
+
+class CommandListMouseTest(CliCase):
+    def test_clicking_a_command_in_the_list_runs_it(self):
+        async def driver(app, pipe, transcript):
+            pipe.send_text("/the")
+            await wait_for(lambda: window_fragments(app, "/theme") is not None)
+            handler_for(window_fragments(app, "/theme"), "/theme")(mouse(MouseEventType.MOUSE_UP))
+            await wait_for(lambda: window_fragments(app, "Cetak Biru") is not None)
+            self.assertEqual(app.current_buffer.text, "")
+
+        self.run_main(driver, Replies())
+
+    def test_clicking_a_file_in_the_list_tags_it_without_sending(self):
+        Path("alpha.txt").write_text("a")
+
+        async def driver(app, pipe, transcript):
+            pipe.send_text("look at @alp")
+            await wait_for(lambda: window_fragments(app, "@alpha.txt") is not None)
+            handler_for(window_fragments(app, "@alpha.txt"), "@alpha.txt")(mouse(MouseEventType.MOUSE_UP))
+            await wait_for(lambda: app.current_buffer.text == "look at @alpha.txt ")
+
+        replies = Replies()
+        self.run_main(driver, replies)
+        self.assertEqual(replies.calls, [])
+
+    def test_the_wheel_moves_the_approval_choice(self):
+        replies, decisions = approval_replies("touch a")
+
+        def choice(app):
+            return next(fragment[1] for fragment in approval_panel(app)[1] if fragment[0] == t.selected).strip()
+
+        async def driver(app, pipe, transcript):
+            await say(pipe, "go")
+            await wait_for(lambda: approval_panel(app)[1] is not None)
+            self.assertIn("Allow once", choice(app))
+            handler_for(approval_panel(app)[1], "Allow this command?")(mouse(MouseEventType.SCROLL_DOWN))
+            self.assertIn("Allow all commands this session", choice(app))
+            handler_for(approval_panel(app)[1], "Deny")(mouse(MouseEventType.SCROLL_DOWN))
+            handler_for(approval_panel(app)[1], "Deny")(mouse(MouseEventType.SCROLL_DOWN))
+            handler_for(approval_panel(app)[1], "Deny")(mouse(MouseEventType.SCROLL_DOWN))
+            self.assertIn("Deny", choice(app))
+            handler_for(approval_panel(app)[1], "Deny")(mouse(MouseEventType.SCROLL_UP))
+            self.assertIn("Always allow", choice(app))
+            pipe.send_text(ESCAPE)
+            await wait_for(lambda: decisions[0][1].event.is_set())
+
+        self.run_main(driver, replies)
 
 
 class UndoTest(CliCase):

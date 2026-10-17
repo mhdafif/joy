@@ -440,6 +440,20 @@ def main(argv: list[str] | None = None) -> None:
         get_app().invalidate()
         return None
 
+    def click_suggestion(index: int) -> Callable[[MouseEvent], None]:
+        def handler(mouse_event: MouseEvent):
+            nonlocal selected
+            if mouse_event.event_type == MouseEventType.MOUSE_MOVE:
+                selected = index
+            elif mouse_event.event_type == MouseEventType.MOUSE_UP:
+                selected = index
+                send_input()
+            else:
+                return wheel_suggestions(mouse_event)
+            get_app().invalidate()
+            return None
+        return handler
+
     def suggestion_rows() -> list[list[tuple]]:
         nonlocal suggestion_top
         options = suggestions()
@@ -473,7 +487,7 @@ def main(argv: list[str] | None = None) -> None:
                 position = index - suggestion_top
                 on_thumb = thumb_start <= position < thumb_start + thumb_size
                 row.append((t.muted if on_thumb else t.subtle, "┃" if on_thumb else "│"))
-            rows.append([(style, text, wheel_suggestions) for style, text in row])
+            rows.append([(style, text, click_suggestion(index)) for style, text in row])
         return rows
 
     def render_suggestions() -> StyleAndTextTuples:
@@ -488,11 +502,44 @@ def main(argv: list[str] | None = None) -> None:
     def modal_width() -> int:
         return max(40, min(get_app().output.get_size().columns - 6, 76))
 
+    def click_only(action: Callable[[], None]) -> Callable[[MouseEvent], None]:
+        def handler(mouse_event: MouseEvent):
+            if mouse_event.event_type != MouseEventType.MOUSE_UP:
+                return NotImplemented
+            action()
+            get_app().invalidate()
+            return None
+        return handler
+
     def title_row(title: str) -> StyleAndTextTuples:
         gap = " " * max(1, modal_width() - 4 - get_cwidth(title) - 3)
-        return [(t.strong, title), ("", gap), (t.muted, "esc")]
+        return [(t.strong, title), ("", gap), (t.muted, "esc", click_only(dismiss_modal))]
 
-    def picker_rows() -> list[list[tuple[str, str]]]:
+    def wheel_picker(mouse_event: MouseEvent):
+        nonlocal picked
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            step = -1
+        elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            step = 1
+        else:
+            return NotImplemented
+        count = len(visible_items())
+        picked = max(0, min(min(picked, count - 1) + step, count - 1))
+        get_app().invalidate()
+        return None
+
+    def click_item(index: int) -> Callable[[MouseEvent], None]:
+        def handler(mouse_event: MouseEvent):
+            nonlocal picked
+            if mouse_event.event_type != MouseEventType.MOUSE_UP:
+                return wheel_picker(mouse_event)
+            picked = index
+            choose_item()
+            get_app().invalidate()
+            return None
+        return handler
+
+    def picker_rows() -> list[list[tuple]]:
         items = visible_items()
         width = modal_width() - 4
         searching = bool(modal_buffer.text.strip()) and picker_searchable
@@ -513,18 +560,18 @@ def main(argv: list[str] | None = None) -> None:
             entries.extend(("item", index, "") for index, item in enumerate(items) if item.group == group)
         selected_entry = next((i for i, entry in enumerate(entries) if entry[0] == "item" and entry[1] == current_index), 0)
         start = max(0, min(selected_entry - limit // 2, len(entries) - limit))
-        rows: list[list[tuple[str, str]]] = []
+        rows: list[list[tuple]] = []
         if not entries:
-            rows.append([(t.muted, "No matches")])
+            rows.append([(t.muted, "No matches", wheel_picker)])
         for kind, index, text in entries[start:start + limit]:
             if kind == "gap":
-                rows.append([("", " ")])
+                rows.append([("", " ", wheel_picker)])
                 continue
             if kind == "header":
-                rows.append([(t.group, text)])
+                rows.append([(t.group, text, wheel_picker)])
                 continue
             if kind == "note":
-                rows.append([(t.muted, f"  {text}")])
+                rows.append([(t.muted, f"  {text}", wheel_picker)])
                 continue
             item = items[index]
             marker = "● " if item.current else "  "
@@ -533,11 +580,12 @@ def main(argv: list[str] | None = None) -> None:
             while get_cwidth(name) > room:
                 name = name[:-2] + "…"
             gap = " " * max(1, width - get_cwidth(name) - get_cwidth(item.detail) - 2)
+            pick = click_item(index)
             if index == current_index:
-                rows.append([(t.selected, f"{marker}{name}{gap}{item.detail}")])
+                rows.append([(t.selected, f"{marker}{name}{gap}{item.detail}", pick)])
             else:
                 label_style = t.accent if item.current else t.text
-                rows.append([(label_style, f"{marker}{name}"), ("", gap), (t.muted, item.detail)])
+                rows.append([(label_style, f"{marker}{name}", pick), ("", gap, pick), (t.muted, item.detail, pick)])
         return rows
 
     def form_rows() -> list[list[tuple[str, str]]]:
@@ -1192,6 +1240,17 @@ def main(argv: list[str] | None = None) -> None:
         decide(value)
         get_app().invalidate()
 
+    def wheel_approval(mouse_event: MouseEvent):
+        nonlocal approval_index
+        if mouse_event.event_type == MouseEventType.SCROLL_UP:
+            approval_index = max(0, approval_index - 1)
+        elif mouse_event.event_type == MouseEventType.SCROLL_DOWN:
+            approval_index = min(len(APPROVAL_CHOICES) - 1, approval_index + 1)
+        else:
+            return NotImplemented
+        get_app().invalidate()
+        return None
+
     def approval_rows() -> list[list[tuple]]:
         if approval is None:
             return []
@@ -1203,8 +1262,8 @@ def main(argv: list[str] | None = None) -> None:
         limit = max(3, min(12, get_app().output.get_size().rows - 14))
         if len(lines) > limit:
             lines = [*lines[:limit - 1], f"… {len(lines) - limit + 1} more lines"]
-        rows: list[list[tuple]] = [[(t.row_skill, " Allow this command?".ljust(width))]]
-        rows.extend([(t.row, f"  {line}".ljust(width))] for line in lines)
+        rows: list[list[tuple]] = [[(t.row_skill, " Allow this command?".ljust(width), wheel_approval)]]
+        rows.extend([(t.row, f"  {line}".ljust(width), wheel_approval)] for line in lines)
         for index, (value, label) in enumerate(APPROVAL_CHOICES):
             if value == "always" and approval[2]:
                 label = f"Always allow {' '.join(approval[2])} …"
@@ -1215,13 +1274,13 @@ def main(argv: list[str] | None = None) -> None:
                 elif mouse_event.event_type == MouseEventType.MOUSE_UP:
                     resolve_approval(value)
                 else:
-                    return NotImplemented
+                    return wheel_approval(mouse_event)
                 get_app().invalidate()
                 return None
 
             marker = "● " if index == approval_index else "  "
             rows.append([(t.selected if index == approval_index else t.row, f" {marker}{index + 1}  {label}".ljust(width), pick)])
-        rows.append([(t.row_muted, " Enter to choose · 1-4 picks · Esc denies".ljust(width))])
+        rows.append([(t.row_muted, " Enter to choose · 1-4 picks · Esc denies".ljust(width), wheel_approval)])
         return rows
 
     async def run_turn(
@@ -1527,8 +1586,7 @@ def main(argv: list[str] | None = None) -> None:
         options = suggestions()
         apply_suggestion(options[min(selected, len(options) - 1)])
 
-    @bindings.add("enter")
-    def submit(event: KeyPressEvent) -> None:
+    def send_input() -> None:
         options = suggestions()
         if options and apply_suggestion(options[min(selected, len(options) - 1)]):
             return
@@ -1553,6 +1611,10 @@ def main(argv: list[str] | None = None) -> None:
             return
         buffer.reset(append_to_history=True)
         handle(message)
+
+    @bindings.add("enter")
+    def submit(event: KeyPressEvent) -> None:
+        send_input()
 
     @bindings.add("up", filter=Condition(lambda: bool(queue) and not buffer.text) & ~modal_open)
     def recall_queued(event: KeyPressEvent) -> None:
@@ -1738,7 +1800,7 @@ def main(argv: list[str] | None = None) -> None:
         form_input,
         text_window(lambda: [(t.danger, form_error or " ")]),
         blank(),
-        text_window(lambda: [(t.strong, "Enter"), (t.muted, " to continue")]),
+        text_window(lambda: [(t.strong, "Enter", click_only(advance_connect)), (t.muted, " to continue", click_only(advance_connect))]),
     ])
 
     def modal_float(body: HSplit, active: Condition) -> Float:
