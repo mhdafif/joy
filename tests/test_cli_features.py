@@ -22,6 +22,14 @@ from joy.tools import Change
 from joy.transcript import Transcript
 
 
+def click_on(app, transcript, needle, offset=0):
+    width = app.output.get_size().columns
+    lines = [to_plain_text(line) for line in transcript.lines(width)]
+    index = max(i for i, line in enumerate(lines) if needle in line)
+    row = index - max(0, len(lines) - transcript.height) + 1
+    return f"\x1b[<0;{lines[index].index(needle) + 1 + offset};{row}m"
+
+
 async def say(pipe, text):
     pipe.send_text(text + "\r")
     await settle(0.05)
@@ -196,26 +204,19 @@ class ModesAndContextTest(CliCase):
             yield Change("big.txt", "created", "", body)
             yield "made it"
 
-        def click_at(app, transcript, needle, offset=0):
-            width = app.output.get_size().columns
-            lines = [to_plain_text(line) for line in transcript.lines(width)]
-            index = max(i for i, line in enumerate(lines) if needle in line)
-            row = index - max(0, len(lines) - transcript.height) + 1
-            return f"\x1b[<0;{lines[index].index(needle) + 1 + offset};{row}m"
-
         async def driver(app, pipe, transcript):
             await say(pipe, "make big.txt")
             await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
             self.assertIn("more lines · click to expand", transcript.plain())
             self.assertNotIn("line 40", transcript.plain())
-            pipe.send_text(click_at(app, transcript, "more lines", 60))
+            pipe.send_text(click_on(app, transcript, "more lines", 60))
             await settle(0.2)
             self.assertNotIn("line 40", transcript.plain())
-            pipe.send_text(click_at(app, transcript, "more lines"))
+            pipe.send_text(click_on(app, transcript, "more lines"))
             await wait_for(lambda: "line 40" in transcript.plain())
             self.assertIn("click to collapse", transcript.plain())
             self.assertNotIn("click to expand", transcript.plain())
-            pipe.send_text(click_at(app, transcript, "click to collapse"))
+            pipe.send_text(click_on(app, transcript, "click to collapse"))
             await wait_for(lambda: "line 40" not in transcript.plain())
             self.assertIn("more lines · click to expand", transcript.plain())
 
@@ -885,10 +886,11 @@ class UndoTest(CliCase):
 
         async def driver(app, pipe, transcript):
             await self.two_turns(pipe, transcript)
-            await say(pipe, "/undo")
+            pipe.send_text(click_on(app, transcript, "change n"))
             await settle(0.25)
             pipe.send_text("\r")
-            await wait_for(lambda: "Copied to the clipboard." in transcript.plain())
+            await wait_for(lambda: copied == ["change n"])
+            await wait_for(lambda: "copied" in transcript.plain())
 
         with patch("joy.cli.copy_text", side_effect=lambda text: copied.append(text) or True):
             self.run_main(driver, replies)
@@ -900,8 +902,6 @@ class UndoTest(CliCase):
         async def driver(app, pipe, transcript):
             await self.two_turns(pipe, transcript)
             await say(pipe, "/undo")
-            await settle(0.25)
-            pipe.send_text(DOWN + "\r")
             await wait_for(lambda: "Undid the task" in transcript.plain())
             self.assertEqual(Path("n.txt").read_text(), "v1\n")
             self.assertNotIn("› change n", transcript.plain())
@@ -911,8 +911,6 @@ class UndoTest(CliCase):
             await say(pipe, "retry")
             await wait_for(lambda: transcript.plain().count(FOOTER) == 2)
             await say(pipe, "/undo")
-            await settle(0.25)
-            pipe.send_text(DOWN + "\r")
             await wait_for(lambda: app.current_buffer.text == "retry")
 
         self.run_main(driver, replies)
@@ -925,14 +923,10 @@ class UndoTest(CliCase):
         async def driver(app, pipe, transcript):
             await self.two_turns(pipe, transcript)
             await say(pipe, "/undo")
-            await settle(0.25)
-            pipe.send_text(DOWN + "\r")
             await wait_for(lambda: "Undid the task" in transcript.plain())
             await wait_for(lambda: app.current_buffer.text == "change n")
             app.current_buffer.reset()
             await say(pipe, "/undo")
-            await settle(0.25)
-            pipe.send_text(DOWN + "\r")
             await wait_for(lambda: not Path("n.txt").exists())
             await wait_for(lambda: app.current_buffer.text == "make n")
 
@@ -947,8 +941,6 @@ class UndoTest(CliCase):
             await wait_for(lambda: transcript.plain().count(FOOTER) == 1)
             Path("n.txt").write_text("my own edit\n")
             await say(pipe, "/undo")
-            await settle(0.25)
-            pipe.send_text(DOWN + "\r")
             await wait_for(lambda: "Left alone because they changed afterwards: n.txt" in transcript.plain())
             self.assertEqual(Path("n.txt").read_text(), "my own edit\n")
 
@@ -962,8 +954,6 @@ class UndoTest(CliCase):
 
         async def driver(app, pipe, transcript):
             await say(pipe, "/undo")
-            await settle(0.25)
-            pipe.send_text(DOWN + "\r")
             await wait_for(lambda: "cannot be undone" in transcript.plain())
 
         self.run_main(driver, Replies(), argv=["-c"])

@@ -100,7 +100,7 @@ COMMANDS = dict(sorted({
     "/compact": "summarize the conversation to free up context",
     "/disconnect": "remove a saved API connection",
     "/export": "save this session as a Markdown file",
-    "/undo": "undo a task: revert its file changes and rewind the chat",
+    "/undo": "undo your last message: revert its file changes and rewind the chat",
     "/build": "build mode: Joy can change files",
     "/plan": "plan mode: Joy only investigates and proposes a plan",
     "/session": "switch to another session",
@@ -1547,7 +1547,7 @@ def main(argv: list[str] | None = None) -> None:
                 emit(Text("There is nothing to undo yet.", style="dim"))
                 emit()
             else:
-                open_task_modal(None, last)
+                perform_undo(last)
             return
         command, _, argument = message.partition(" ")
         if command == "/export":

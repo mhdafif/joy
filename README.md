@@ -80,7 +80,7 @@ Joy opens on its own full-screen page, like vim or OpenCode, and your terminal i
 - **/session** — pick a saved session to continue. It opens in a window in the middle of the screen: sessions are listed newest first, named after your first message, with the date on the right; type to search, Up/Down to move, Enter to open, Esc to close.
 - **Click outside a window** — closes any centered window (the same as Esc).
 - **/new** or **/clear** — start a new session without leaving Joy; the old one stays saved.
-- **/undo** — open that same window for your latest message.
+- **/undo** — undo your latest message right away, the same as choosing Undo in that window. Run it again to go back one message further.
 - **/compact** — ask the model to summarize the conversation so far and continue from the summary, which frees up context. The footer shows how much context is in use (`12.4k ctx`, with a `~` when it is an estimate).
 - **/export [file]** — save the session as Markdown (messages, steps, diffs). Without a file name it goes to `~/.joy/exports/`.
 - **/disconnect** — remove a saved connection and its API key, after a confirmation window.
