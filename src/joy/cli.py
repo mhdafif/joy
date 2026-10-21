@@ -47,6 +47,7 @@ from joy.clipboard import copy_text, osc52
 from joy.export import to_markdown
 from joy.folder import open_folder, shorten_folder
 from joy.instructions import load_instructions
+from joy.keys import DISABLE, ENABLE, register as register_keys
 from joy.diffview import COLLAPSE_LABEL, COLLAPSED_LINES, EXPAND_LABEL, merge_changes, render_change
 from joy.mentions import (
     active_mention, expand as expand_mentions, mentioned_skills, references, search as search_paths, workspace_paths,
@@ -495,7 +496,7 @@ def main(argv: list[str] | None = None) -> None:
 
     def render_hint() -> StyleAndTextTuples:
         return join_rows([
-            [(t.subtle, f"Enter sends · {NEWLINE_KEY} or Ctrl+J adds a new line")],
+            [(t.subtle, f"Enter sends · Shift+Enter, {NEWLINE_KEY} or Ctrl+J adds a new line")],
             [("", " ")],
         ])
 
@@ -1878,6 +1879,17 @@ def main(argv: list[str] | None = None) -> None:
     )
     app.timeoutlen = 0.25
     app.ttimeoutlen = 0.05
+    register_keys()
+    keys_enabled = False
+
+    def enable_keys(sender: Application) -> None:
+        nonlocal keys_enabled
+        if not keys_enabled:
+            keys_enabled = True
+            sender.output.write_raw(ENABLE)
+            sender.output.flush()
+
+    app.after_render.add_handler(enable_keys)
     show_banner()
     if arguments.resume:
         previous = latest_session(workspace)
@@ -1886,7 +1898,11 @@ def main(argv: list[str] | None = None) -> None:
         else:
             emit(Text("No earlier session in this folder; starting a new one.", style="dim"))
             emit()
-    app.run()
+    try:
+        app.run()
+    finally:
+        app.output.write_raw(DISABLE)
+        app.output.flush()
     if restart:
         console.print("[dim]Restarting Joy…[/dim]")
         sys.stdout.flush()

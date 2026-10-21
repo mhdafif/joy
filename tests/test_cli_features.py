@@ -833,6 +833,31 @@ class CommandListMouseTest(CliCase):
         self.run_main(driver, replies)
 
 
+class NewlineKeysTest(CliCase):
+    def test_shift_enter_adds_a_line_in_both_terminal_encodings(self):
+        replies = Replies()
+
+        async def driver(app, pipe, transcript):
+            pipe.send_text("a\x1b[13;2ub\x1b[27;2;13~c")
+            await wait_for(lambda: app.current_buffer.text == "a\nb\nc")
+            pipe.send_text("\x1b[13;3ud")
+            await wait_for(lambda: app.current_buffer.text == "a\nb\nc\nd")
+
+        self.run_main(driver, replies)
+        self.assertEqual(replies.calls, [])
+
+    def test_keys_a_terminal_reports_as_escape_codes_still_work(self):
+        async def driver(app, pipe, transcript):
+            pipe.send_text("abc")
+            await wait_for(lambda: app.current_buffer.text == "abc")
+            pipe.send_text("\x1b[99;5u")
+            await wait_for(lambda: app.current_buffer.text == "")
+            pipe.send_text("x\x1b[13;5uy")
+            await wait_for(lambda: app.current_buffer.text == "x\ny")
+
+        self.run_main(driver, Replies())
+
+
 class InputHistoryTest(CliCase):
     def test_slash_commands_are_not_kept_in_the_input_history(self):
         async def driver(app, pipe, transcript):
